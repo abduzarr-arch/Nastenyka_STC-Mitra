@@ -1,4 +1,4 @@
-python-telegram-bot>=20.0
+﻿python-telegram-bot>=20.0
 requests>=2.25.0
 pytz>=2023.3
 PyMuPDF>=1.23.0

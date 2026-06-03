@@ -1,14 +1,14 @@
-import os
+ï»¿import os
 import logging
 import pytz
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")   # <-- íîâûé êëþ÷ äëÿ Whisper
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")   # <-- Ð½Ð¾Ð²Ñ‹Ð¹ ÐºÐ»ÑŽÑ‡ Ð´Ð»Ñ Whisper
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x]
 
-BOT_NAME = "ÈÈ Íàñòåíüêà"
-COMPANY_NAME = "ÎÎÎ «ÍÒÖ Ìèòðà»"
+BOT_NAME = "Ð˜Ð˜ ÐÐ°ÑÑ‚ÐµÐ½ÑŒÐºÐ°"
+COMPANY_NAME = "ÐžÐžÐž Â«ÐÐ¢Ð¦ ÐœÐ¸Ñ‚Ñ€Ð°Â»"
 TIMEZONE = pytz.timezone('Europe/Moscow')
 
 MAX_CONTEXT_TOKENS = 900_000
