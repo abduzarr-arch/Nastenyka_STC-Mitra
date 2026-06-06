@@ -258,9 +258,18 @@ def _call_deepseek_for_word(system_prompt: str, user_prompt: str, max_tokens: in
         "temperature": temperature,
     }
     headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
-    response = requests.post(DEEPSEEK_API_URL, headers=headers, json=data, timeout=140)
-    response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"]
+    try:
+        response = requests.post(DEEPSEEK_API_URL, headers=headers, json=data, timeout=140)
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
+    except requests.HTTPError as e:
+        detail = (getattr(e.response, "text", "") or "")[:500]
+        status = getattr(e.response, "status_code", "unknown")
+        raise WordProcessingError(f"ИИ-сервис вернул ошибку HTTP {status}. {detail}") from e
+    except requests.RequestException as e:
+        raise WordProcessingError(f"ИИ-сервис временно недоступен или не ответил: {e}") from e
+    except (KeyError, IndexError, ValueError) as e:
+        raise WordProcessingError("ИИ-сервис вернул ответ в неожиданном формате") from e
 
 
 def _extract_json(text: str) -> Dict[str, Any]:
@@ -276,7 +285,7 @@ def _extract_json(text: str) -> Dict[str, Any]:
         end = cleaned.rfind("}")
         if start != -1 and end != -1 and end > start:
             return json.loads(cleaned[start:end + 1])
-        raise
+        raise WordProcessingError("ИИ не смог сформировать корректный JSON-план правок") from None
 
 
 def analyze_word_with_ai(path: str, file_name: str, question: str, user_id: str, reference_context: str = "") -> str:
@@ -334,13 +343,26 @@ def build_word_patch_with_ai(path: str, file_name: str, request_text: str, refer
 - Не удаляй большие фрагменты, если пользователь явно не просит.
 - Не используй макросы, внешние ссылки и произвольный код.
 """.strip()
-    user_prompt = (
-        f"Файл: {file_name}\n\n"
-        f"Текст DOCX:\n{document_text}\n\n"
-        f"Дополнительные документы/контекст (ТЗ, КП, PDF, TXT), если были переданы:\n{reference_context or '[нет]'}\n\n"
-        f"Просьба пользователя:\n{request_text}"
-    )
-    raw = _call_deepseek_for_word(system_prompt, user_prompt, max_tokens=3600, temperature=0.0)
+    def make_user_prompt(ref_context: str) -> str:
+        return (
+            f"Файл: {file_name}\n\n"
+            f"Текст DOCX:\n{document_text}\n\n"
+            f"Дополнительные документы/контекст (ТЗ, КП, PDF, TXT), если были переданы:\n{ref_context or '[нет]'}\n\n"
+            f"Просьба пользователя:\n{request_text}"
+        )
+
+    user_prompt = make_user_prompt(reference_context)
+    try:
+        raw = _call_deepseek_for_word(system_prompt, user_prompt, max_tokens=3600, temperature=0.0)
+    except WordProcessingError:
+        if not reference_context or len(reference_context) <= 9000:
+            raise
+        reduced_context = _clip_text_at_boundary(
+            reference_context,
+            9000,
+            "\n... [контекст ТЗ/КП сокращен для повторной попытки]",
+        )
+        raw = _call_deepseek_for_word(system_prompt, make_user_prompt(reduced_context), max_tokens=3600, temperature=0.0)
     patch = _extract_json(raw)
     if not isinstance(patch, dict):
         raise WordProcessingError("ИИ вернул не объект JSON")
@@ -683,7 +705,9 @@ async def handle_word_document(update, context) -> None:
         user_id = get_dialog_key(update)
         remember_word_file(context, update.effective_chat.id, tmp_path, file_name, user_id)
         remembered_text = document_to_text(tmp_path, max_paragraphs=260, max_tables=15, max_table_rows=40)
-        _remember_reference_document(context, user_id, file_name, remembered_text)
+        is_edit_request = looks_like_word_edit_request(user_request)
+        if not is_edit_request:
+            _remember_reference_document(context, user_id, file_name, remembered_text)
         reference_context = _format_reference_documents(_get_reference_documents(context, user_id))
 
         if not user_request:
@@ -699,7 +723,7 @@ async def handle_word_document(update, context) -> None:
             )
             return
 
-        if looks_like_word_edit_request(user_request):
+        if is_edit_request:
             out_path, message, changes = await asyncio.to_thread(edit_word_with_ai, tmp_path, file_name, user_request, user_id, reference_context)
             if out_path:
                 remember_word_file(context, update.effective_chat.id, out_path, os.path.basename(out_path), user_id)
@@ -715,6 +739,13 @@ async def handle_word_document(update, context) -> None:
             answer = await asyncio.to_thread(analyze_word_with_ai, tmp_path, file_name, user_request, user_id, reference_context)
             await update.message.reply_text(answer)
 
+    except WordProcessingError as e:
+        logger.exception(f"Word AI processing error for {file_name}: {e}")
+        await update.message.reply_text(
+            "Word-файл прочитан, но не удалось выполнить обработку через ИИ.\n"
+            f"Причина: {e}\n\n"
+            "Файл не обязательно поврежден. Часто это бывает из-за лимита контекста, сбоя API или некорректного JSON-ответа модели."
+        )
     except Exception as e:
         logger.exception(f"Word processing error for {file_name}: {e}")
         await update.message.reply_text(
@@ -764,6 +795,13 @@ async def handle_word_followup_text(update, context, text: str) -> bool:
             answer = await asyncio.to_thread(analyze_word_with_ai, input_path, file_name, request_text, user_id, reference_context)
             await update.message.reply_text(answer)
         context.user_data.get("awaiting_word_request_by_dialog", {}).pop(dialog_key, None)
+        return True
+    except WordProcessingError as e:
+        logger.exception(f"Word followup AI processing error for {file_name}: {e}")
+        await update.message.reply_text(
+            "Последний Word-файл прочитан, но не удалось выполнить обработку через ИИ.\n"
+            f"Причина: {e}"
+        )
         return True
     except Exception as e:
         logger.exception(f"Word followup processing error for {file_name}: {e}")
