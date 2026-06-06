@@ -15,12 +15,21 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
+from openai import OpenAI
 
-from config import DEEPSEEK_API_KEY, MAX_RESPONSE_TOKENS, logger
+from config import (
+    DEEPSEEK_API_KEY,
+    DEEPSEEK_MODEL,
+    EXCEL_AI_PROVIDER,
+    EXCEL_OPENAI_MODEL,
+    OPENAI_API_KEY,
+    logger,
+)
 from database import add_to_conversation
 from group_utils import get_dialog_key
 
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
+openai_excel_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 SUPPORTED_EXCEL_EXTENSIONS = (".xlsx",)
 UNSUPPORTED_EXCEL_EXTENSIONS = (".xls", ".xlsm", ".xlsb", ".ods")
@@ -197,7 +206,10 @@ def _trim_text(text: str, limit: int = 45000) -> str:
 
 def workbook_to_text(path: str, max_rows_per_sheet: int = 80, max_cols_per_sheet: int = 25) -> str:
     """Делает текстовое представление Excel для ИИ: размеры листов, заголовки, первые строки."""
-    wb = load_workbook(path, data_only=False)
+    try:
+        wb = load_workbook(path, data_only=False)
+    except Exception as e:
+        raise ExcelProcessingError(f"openpyxl не смог прочитать книгу: {e}") from e
     parts: List[str] = []
     parts.append(f"Книга содержит листы: {', '.join(wb.sheetnames)}")
 
@@ -209,6 +221,18 @@ def workbook_to_text(path: str, max_rows_per_sheet: int = 80, max_cols_per_sheet
             merged = ", ".join(str(rng) for rng in list(ws.merged_cells.ranges)[:20])
             parts.append(f"Объединенные ячейки: {merged}")
 
+        formulas = []
+        for row in ws.iter_rows(min_row=1, max_row=min(ws.max_row, max_rows_per_sheet), min_col=1, max_col=min(ws.max_column, max_cols_per_sheet)):
+            for cell in row:
+                if isinstance(cell.value, str) and cell.value.startswith("="):
+                    formulas.append(f"{cell.coordinate}={cell.value[:120]}")
+                    if len(formulas) >= 20:
+                        break
+            if len(formulas) >= 20:
+                break
+        if formulas:
+            parts.append("Формулы: " + "; ".join(formulas))
+
         rows_limit = min(ws.max_row, max_rows_per_sheet)
         cols_limit = min(ws.max_column, max_cols_per_sheet)
         if rows_limit == 0 or cols_limit == 0:
@@ -218,8 +242,8 @@ def workbook_to_text(path: str, max_rows_per_sheet: int = 80, max_cols_per_sheet
         for row in ws.iter_rows(min_row=1, max_row=rows_limit, min_col=1, max_col=cols_limit):
             values = [_cell_value_to_text(cell.value) for cell in row]
             # Обрезаем длинные тексты в ячейках.
-            values = [v if len(v) <= 120 else v[:120] + "..." for v in values]
-            parts.append(" | ".join(values))
+            values = [v if len(v) <= 220 else v[:220] + "..." for v in values]
+            parts.append(f"R{row[0].row}: " + " | ".join(values))
 
         if ws.max_row > rows_limit:
             parts.append(f"... показаны первые {rows_limit} строк из {ws.max_row}")
@@ -233,22 +257,86 @@ def _call_deepseek_for_excel(system_prompt: str, user_prompt: str, max_tokens: i
     if not DEEPSEEK_API_KEY:
         raise ExcelProcessingError("Не настроен DEEPSEEK_API_KEY")
 
+    try:
+        excel_token_limit = int(os.getenv("EXCEL_MAX_RESPONSE_TOKENS", "6000"))
+    except ValueError:
+        excel_token_limit = 6000
+
     data = {
-        "model": "deepseek-chat",
+        "model": DEEPSEEK_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "max_tokens": min(MAX_RESPONSE_TOKENS, max_tokens),
+        "max_tokens": max(512, min(excel_token_limit, max_tokens)),
         "temperature": temperature,
     }
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json",
     }
-    response = requests.post(DEEPSEEK_API_URL, headers=headers, json=data, timeout=120)
-    response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"]
+    try:
+        response = requests.post(DEEPSEEK_API_URL, headers=headers, json=data, timeout=120)
+        response.raise_for_status()
+        payload = response.json()
+        choice = payload["choices"][0]
+        content = (choice.get("message") or {}).get("content") or ""
+        finish_reason = choice.get("finish_reason") or "unknown"
+        if not content.strip():
+            raise ExcelProcessingError(f"ИИ вернул пустой ответ (finish_reason={finish_reason})")
+        return content
+    except ExcelProcessingError:
+        raise
+    except requests.HTTPError as e:
+        detail = (getattr(e.response, "text", "") or "")[:500]
+        status = getattr(e.response, "status_code", "unknown")
+        raise ExcelProcessingError(f"ИИ-сервис вернул ошибку HTTP {status}. {detail}") from e
+    except requests.RequestException as e:
+        raise ExcelProcessingError(f"ИИ-сервис временно недоступен или не ответил: {e}") from e
+    except (KeyError, IndexError, ValueError) as e:
+        raise ExcelProcessingError("ИИ-сервис вернул ответ в неожиданном формате") from e
+
+
+def _call_openai_for_excel(system_prompt: str, user_prompt: str, max_tokens: int = 2500, temperature: float = 0.1) -> str:
+    if not openai_excel_client:
+        raise ExcelProcessingError("Не настроен OPENAI_API_KEY для обработки Excel")
+
+    try:
+        excel_token_limit = int(os.getenv("EXCEL_MAX_RESPONSE_TOKENS", "6000"))
+    except ValueError:
+        excel_token_limit = 6000
+
+    try:
+        response = openai_excel_client.chat.completions.create(
+            model=EXCEL_OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=max(512, min(excel_token_limit, max_tokens)),
+            temperature=temperature,
+        )
+        choice = response.choices[0]
+        content = choice.message.content or ""
+        finish_reason = choice.finish_reason or "unknown"
+        if not content.strip():
+            raise ExcelProcessingError(f"OpenAI вернул пустой ответ (finish_reason={finish_reason})")
+        return content
+    except ExcelProcessingError:
+        raise
+    except Exception as e:
+        raise ExcelProcessingError(f"OpenAI не смог обработать Excel-запрос: {e}") from e
+
+
+def _call_ai_for_excel(system_prompt: str, user_prompt: str, max_tokens: int = 2500, temperature: float = 0.1) -> str:
+    if EXCEL_AI_PROVIDER == "openai":
+        return _call_openai_for_excel(system_prompt, user_prompt, max_tokens=max_tokens, temperature=temperature)
+    if EXCEL_AI_PROVIDER == "auto" and openai_excel_client:
+        try:
+            return _call_openai_for_excel(system_prompt, user_prompt, max_tokens=max_tokens, temperature=temperature)
+        except ExcelProcessingError as openai_error:
+            logger.warning(f"OpenAI Excel fallback failed, trying DeepSeek: {openai_error}")
+    return _call_deepseek_for_excel(system_prompt, user_prompt, max_tokens=max_tokens, temperature=temperature)
 
 
 def _extract_json(text: str) -> Dict[str, Any]:
@@ -277,7 +365,7 @@ def analyze_excel_with_ai(path: str, file_name: str, question: str, user_id: str
         "Если данных недостаточно из-за обрезки, честно скажи об этом."
     )
     user_prompt = f"Файл: {file_name}\n\nДанные Excel:\n{summary}\n\nВопрос пользователя:\n{question}"
-    answer = _call_deepseek_for_excel(system_prompt, user_prompt, max_tokens=2500, temperature=0.2)
+    answer = _call_ai_for_excel(system_prompt, user_prompt, max_tokens=3500, temperature=0.2)
     add_to_conversation(user_id, "user", f"[Excel {file_name}] {question}\n{summary[:4000]}")
     add_to_conversation(user_id, "assistant", answer)
     return answer
@@ -338,7 +426,7 @@ def build_excel_patch_with_ai(path: str, file_name: str, request_text: str) -> D
         f"Данные Excel:\n{summary}\n\n"
         f"Просьба пользователя:\n{request_text}"
     )
-    raw = _call_deepseek_for_excel(system_prompt, user_prompt, max_tokens=2500, temperature=0.0)
+    raw = _call_ai_for_excel(system_prompt, user_prompt, max_tokens=3500, temperature=0.0)
     patch = _extract_json(raw)
     if not isinstance(patch, dict):
         raise ExcelProcessingError("ИИ вернул не объект JSON")
@@ -692,7 +780,7 @@ def create_excel_from_request(request_text: str) -> Tuple[str, str]:
 - Формулы Excel должны начинаться с "=".
 """.strip()
     user_prompt = f"Создай Excel-файл по просьбе пользователя:\n{request_text}"
-    raw = _call_deepseek_for_excel(system_prompt, user_prompt, max_tokens=2500, temperature=0.2)
+    raw = _call_ai_for_excel(system_prompt, user_prompt, max_tokens=3500, temperature=0.2)
     spec = _extract_json(raw)
     file_name = _safe_filename(spec.get("filename") or "created_excel.xlsx")
     output_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex[:6]}_{file_name}")
@@ -759,6 +847,13 @@ async def handle_excel_document(update, context) -> None:
             answer = await asyncio.to_thread(analyze_excel_with_ai, tmp_path, file_name, user_request, user_id)
             await update.message.reply_text(answer)
 
+    except ExcelProcessingError as e:
+        logger.exception(f"Excel AI/parse error for {file_name}: {e}")
+        await update.message.reply_text(
+            "Excel-файл получен, но не удалось выполнить анализ/обработку.\n"
+            f"Причина: {e}\n\n"
+            "Файл не обязательно поврежден. Возможна особенность книги, лимит контекста или сбой ИИ-сервиса."
+        )
     except Exception as e:
         logger.exception(f"Excel processing error for {file_name}: {e}")
         await update.message.reply_text(
@@ -810,6 +905,13 @@ async def handle_excel_followup_text(update, context, text: str) -> bool:
             answer = await asyncio.to_thread(analyze_excel_with_ai, input_path, file_name, request_text, user_id)
             await update.message.reply_text(answer)
         context.user_data.get("awaiting_excel_request_by_dialog", {}).pop(dialog_key, None)
+        return True
+    except ExcelProcessingError as e:
+        logger.exception(f"Excel followup AI/parse error for {file_name}: {e}")
+        await update.message.reply_text(
+            "Последний Excel-файл прочитан, но не удалось выполнить обработку.\n"
+            f"Причина: {e}"
+        )
         return True
     except Exception as e:
         logger.exception(f"Excel followup processing error for {file_name}: {e}")
