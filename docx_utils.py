@@ -261,7 +261,14 @@ def _call_deepseek_for_word(system_prompt: str, user_prompt: str, max_tokens: in
     try:
         response = requests.post(DEEPSEEK_API_URL, headers=headers, json=data, timeout=140)
         response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
+        payload = response.json()
+        choice = payload["choices"][0]
+        message = choice.get("message") or {}
+        content = message.get("content") or ""
+        if not content.strip():
+            finish_reason = choice.get("finish_reason") or "unknown"
+            raise WordProcessingError(f"ИИ вернул пустой ответ (finish_reason={finish_reason})")
+        return content
     except requests.HTTPError as e:
         detail = (getattr(e.response, "text", "") or "")[:500]
         status = getattr(e.response, "status_code", "unknown")
@@ -354,15 +361,38 @@ def build_word_patch_with_ai(path: str, file_name: str, request_text: str, refer
     user_prompt = make_user_prompt(reference_context)
     try:
         raw = _call_deepseek_for_word(system_prompt, user_prompt, max_tokens=3600, temperature=0.0)
-    except WordProcessingError:
-        if not reference_context or len(reference_context) <= 9000:
-            raise
+    except WordProcessingError as first_error:
         reduced_context = _clip_text_at_boundary(
             reference_context,
             9000,
             "\n... [контекст ТЗ/КП сокращен для повторной попытки]",
-        )
-        raw = _call_deepseek_for_word(system_prompt, make_user_prompt(reduced_context), max_tokens=3600, temperature=0.0)
+        ) if reference_context else ""
+        try:
+            raw = _call_deepseek_for_word(system_prompt, make_user_prompt(reduced_context), max_tokens=3600, temperature=0.0)
+        except WordProcessingError:
+            simple_system_prompt = """
+Ты редактируешь DOCX по просьбе пользователя. Ответь только валидным JSON без markdown.
+Верни объект:
+{
+  "need_clarification": false,
+  "message": "что будет изменено",
+  "output_filename": "edited.docx",
+  "actions": [
+    {"type":"replace_paragraph_contains","contains":"фраза из договора","paragraphs":["новый текст"]},
+    {"type":"append_section","heading":"Название раздела","paragraphs":["текст"]}
+  ]
+}
+Используй ТЗ/КП как основание. Если точное место замены не найдено, добавь новый раздел append_section.
+Не проси ТЗ/КП повторно, если они есть в контексте. Не выдумывай неизвестные суммы и реквизиты.
+""".strip()
+            simple_request = (
+                "Сделай минимальный JSON-план правок договора по ТЗ/КП.\n\n"
+                f"DOCX:\n{_clip_text_at_boundary(document_text, 18000)}\n\n"
+                f"ТЗ/КП:\n{_clip_text_at_boundary(reduced_context, 7000)}\n\n"
+                f"Просьба:\n{request_text}\n\n"
+                f"Первичная ошибка модели: {first_error}"
+            )
+            raw = _call_deepseek_for_word(simple_system_prompt, simple_request, max_tokens=2800, temperature=0.1)
     patch = _extract_json(raw)
     if not isinstance(patch, dict):
         raise WordProcessingError("ИИ вернул не объект JSON")
