@@ -15,12 +15,14 @@ from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.text.paragraph import Paragraph
+from openai import OpenAI
 
-from config import DEEPSEEK_API_KEY, DEEPSEEK_MODEL, logger
+from config import DEEPSEEK_API_KEY, DEEPSEEK_MODEL, OPENAI_API_KEY, WORD_AI_PROVIDER, WORD_OPENAI_MODEL, logger
 from database import add_to_conversation
 from group_utils import get_dialog_key
 
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
+openai_word_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 SUPPORTED_WORD_EXTENSIONS = (".docx",)
 UNSUPPORTED_WORD_EXTENSIONS = (".doc", ".rtf", ".odt")
@@ -286,6 +288,50 @@ def _call_deepseek_for_word(system_prompt: str, user_prompt: str, max_tokens: in
         raise WordProcessingError("ИИ-сервис вернул ответ в неожиданном формате") from e
 
 
+def _call_openai_for_word(system_prompt: str, user_prompt: str, max_tokens: int = 3000, temperature: float = 0.1) -> str:
+    if not openai_word_client:
+        raise WordProcessingError("Не настроен OPENAI_API_KEY для обработки Word")
+
+    try:
+        word_token_limit = int(os.getenv("WORD_MAX_RESPONSE_TOKENS", "8000"))
+    except ValueError:
+        word_token_limit = 8000
+
+    try:
+        response = openai_word_client.chat.completions.create(
+            model=WORD_OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=max(512, min(word_token_limit, max_tokens)),
+            temperature=temperature,
+        )
+        choice = response.choices[0]
+        content = choice.message.content or ""
+        finish_reason = choice.finish_reason or "unknown"
+        if not content.strip():
+            raise WordProcessingError(f"OpenAI вернул пустой ответ (finish_reason={finish_reason})")
+        if finish_reason == "length" and not content.strip().endswith("}"):
+            raise WordProcessingError("OpenAI не успел завершить JSON-план правок (finish_reason=length)")
+        return content
+    except WordProcessingError:
+        raise
+    except Exception as e:
+        raise WordProcessingError(f"OpenAI не смог обработать Word-запрос: {e}") from e
+
+
+def _call_ai_for_word(system_prompt: str, user_prompt: str, max_tokens: int = 3000, temperature: float = 0.1) -> str:
+    if WORD_AI_PROVIDER == "openai":
+        return _call_openai_for_word(system_prompt, user_prompt, max_tokens=max_tokens, temperature=temperature)
+    if WORD_AI_PROVIDER == "auto" and openai_word_client:
+        try:
+            return _call_openai_for_word(system_prompt, user_prompt, max_tokens=max_tokens, temperature=temperature)
+        except WordProcessingError as openai_error:
+            logger.warning(f"OpenAI Word fallback failed, trying DeepSeek: {openai_error}")
+    return _call_deepseek_for_word(system_prompt, user_prompt, max_tokens=max_tokens, temperature=temperature)
+
+
 def _extract_json(text: str) -> Dict[str, Any]:
     if not text:
         raise WordProcessingError("ИИ вернул пустой ответ")
@@ -316,7 +362,7 @@ def analyze_word_with_ai(path: str, file_name: str, question: str, user_id: str,
         f"Дополнительные документы/контекст (ТЗ, КП, PDF, TXT), если были переданы:\n{reference_context or '[нет]'}\n\n"
         f"Вопрос пользователя:\n{question}"
     )
-    answer = _call_deepseek_for_word(system_prompt, user_prompt, max_tokens=3000, temperature=0.2)
+    answer = _call_ai_for_word(system_prompt, user_prompt, max_tokens=3000, temperature=0.2)
     add_to_conversation(user_id, "user", f"[Word {file_name}] {question}\n{text[:5000]}")
     add_to_conversation(user_id, "assistant", answer)
     return answer
@@ -372,7 +418,7 @@ def build_word_patch_with_ai(path: str, file_name: str, request_text: str, refer
 
     user_prompt = make_user_prompt(reference_context)
     try:
-        raw = _call_deepseek_for_word(system_prompt, user_prompt, max_tokens=7000, temperature=0.0)
+        raw = _call_ai_for_word(system_prompt, user_prompt, max_tokens=7000, temperature=0.0)
     except WordProcessingError as first_error:
         reduced_context = _clip_text_at_boundary(
             reference_context,
@@ -380,7 +426,7 @@ def build_word_patch_with_ai(path: str, file_name: str, request_text: str, refer
             "\n... [контекст ТЗ/КП сокращен для повторной попытки]",
         ) if reference_context else ""
         try:
-            raw = _call_deepseek_for_word(system_prompt, make_user_prompt(reduced_context), max_tokens=7000, temperature=0.0)
+            raw = _call_ai_for_word(system_prompt, make_user_prompt(reduced_context), max_tokens=7000, temperature=0.0)
         except WordProcessingError:
             simple_system_prompt = """
 Ты редактируешь DOCX по просьбе пользователя. Ответь только валидным JSON без markdown.
@@ -404,8 +450,33 @@ def build_word_patch_with_ai(path: str, file_name: str, request_text: str, refer
                 f"Просьба:\n{request_text}\n\n"
                 f"Первичная ошибка модели: {first_error}"
             )
-            raw = _call_deepseek_for_word(simple_system_prompt, simple_request, max_tokens=5000, temperature=0.1)
-    patch = _extract_json(raw)
+            raw = _call_ai_for_word(simple_system_prompt, simple_request, max_tokens=5000, temperature=0.1)
+    try:
+        patch = _extract_json(raw)
+    except WordProcessingError:
+        fallback_text = _call_ai_for_word(
+            "Ты помощник по договорам. На русском языке кратко перечисли конкретные правки договора по ТЗ/КП. Без markdown-таблиц.",
+            (
+                f"Договор:\n{_clip_text_at_boundary(document_text, 12000)}\n\n"
+                f"ТЗ/КП:\n{_clip_text_at_boundary(reference_context, 7000)}\n\n"
+                f"Просьба:\n{request_text}\n\n"
+                "Дай готовый раздел с предлагаемыми изменениями для вставки в конец договора."
+            ),
+            max_tokens=2500,
+            temperature=0.2,
+        )
+        patch = {
+            "need_clarification": False,
+            "message": "Не удалось надежно собрать точечный JSON-план замен, поэтому добавляю в договор раздел с предлагаемыми правками по ТЗ/КП.",
+            "output_filename": f"{Path(file_name).stem}_edited.docx",
+            "actions": [
+                {
+                    "type": "append_section",
+                    "heading": "Предлагаемые правки по ТЗ и КП",
+                    "paragraphs": [p.strip() for p in fallback_text.splitlines() if p.strip()][:25],
+                }
+            ],
+        }
     if not isinstance(patch, dict):
         raise WordProcessingError("ИИ вернул не объект JSON")
     patch.setdefault("need_clarification", False)
@@ -715,7 +786,7 @@ def create_word_from_request(request_text: str) -> Tuple[str, str]:
 - Не больше 12 разделов.
 """.strip()
     user_prompt = f"Создай Word/DOCX-документ по просьбе пользователя:\n{request_text}"
-    raw = _call_deepseek_for_word(system_prompt, user_prompt, max_tokens=3500, temperature=0.2)
+    raw = _call_ai_for_word(system_prompt, user_prompt, max_tokens=3500, temperature=0.2)
     spec = _extract_json(raw)
     file_name = _safe_filename(spec.get("filename") or "created_document.docx")
     output_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex[:6]}_{file_name}")

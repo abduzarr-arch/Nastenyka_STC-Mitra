@@ -31,6 +31,8 @@ TIMEZONE = pytz.timezone(os.getenv("TIMEZONE", "Europe/Moscow"))
 
 MAX_RESPONSE_TOKENS = int(os.getenv("MAX_RESPONSE_TOKENS", "4000"))
 VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o-mini")
+WORD_AI_PROVIDER = os.getenv("WORD_AI_PROVIDER", "deepseek").strip().lower()
+WORD_OPENAI_MODEL = os.getenv("WORD_OPENAI_MODEL", "gpt-4o")
 
 # Онлайн-поиск. Рекомендуемый режим: TAVILY_API_KEY + DeepSeek.
 # Если TAVILY_API_KEY не задан, бот попробует OpenAI web_search через OPENAI_API_KEY.
