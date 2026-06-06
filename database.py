@@ -190,6 +190,23 @@ def init_db():
         )
     ''')
 
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS chat_members (
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            display_name TEXT,
+            status TEXT,
+            first_seen_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            last_seen_at TEXT,
+            PRIMARY KEY(chat_id, user_id)
+        )
+    ''')
+    c.execute("CREATE INDEX IF NOT EXISTS idx_chat_members_user ON chat_members(user_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_chat_members_username ON chat_members(username)")
+
 
 
     c.execute('''
@@ -548,7 +565,7 @@ def upsert_group_chat(chat_id, title, chat_type, alias, registered_by=None):
             alias=excluded.alias,
             title=excluded.title,
             chat_type=excluded.chat_type,
-            registered_by=excluded.registered_by,
+            registered_by=COALESCE(group_chats.registered_by, excluded.registered_by),
             updated_at=excluded.updated_at
     ''', (chat_id, alias, title, chat_type, registered_by, now, now))
     conn.commit()
@@ -571,6 +588,92 @@ def get_all_group_chats():
     rows = c.fetchall()
     conn.close()
     return [dict(row) for row in rows]
+
+
+def upsert_chat_member(chat_id, user_id, username=None, first_name=None, last_name=None, display_name=None, status='member'):
+    if not chat_id or not user_id:
+        return
+    username = (username or '').strip().lstrip('@') or None
+    display_name = display_name or " ".join(part for part in [first_name, last_name] if part).strip() or username or str(user_id)
+    now = datetime.now(TIMEZONE).isoformat()
+    conn = _connect()
+    c = conn.cursor()
+    c.execute('''
+        INSERT INTO chat_members
+        (chat_id, user_id, username, first_name, last_name, display_name, status, first_seen_at, last_seen_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(chat_id, user_id) DO UPDATE SET
+            username=COALESCE(excluded.username, chat_members.username),
+            first_name=COALESCE(excluded.first_name, chat_members.first_name),
+            last_name=COALESCE(excluded.last_name, chat_members.last_name),
+            display_name=COALESCE(excluded.display_name, chat_members.display_name),
+            status=COALESCE(excluded.status, chat_members.status),
+            last_seen_at=excluded.last_seen_at
+    ''', (chat_id, user_id, username, first_name, last_name, display_name, status, now, now))
+    conn.commit()
+    conn.close()
+
+
+def list_chat_members(chat_id=None, limit=200):
+    conn = _connect(row_factory=True)
+    c = conn.cursor()
+    if chat_id is not None:
+        c.execute('''
+            SELECT cm.*, gc.alias AS chat_alias, gc.title AS chat_title
+            FROM chat_members cm
+            LEFT JOIN group_chats gc ON gc.chat_id = cm.chat_id
+            WHERE cm.chat_id = ?
+            ORDER BY lower(cm.display_name) ASC
+            LIMIT ?
+        ''', (chat_id, int(limit)))
+    else:
+        c.execute('''
+            SELECT cm.*, gc.alias AS chat_alias, gc.title AS chat_title
+            FROM chat_members cm
+            LEFT JOIN group_chats gc ON gc.chat_id = cm.chat_id
+            ORDER BY cm.last_seen_at DESC
+            LIMIT ?
+        ''', (int(limit),))
+    rows = c.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def find_chat_member(name_or_username, chat_id=None):
+    key = str(name_or_username or '').strip().lstrip('@')
+    if not key:
+        return None
+    conn = _connect(row_factory=True)
+    c = conn.cursor()
+    params = [key, key, key, f"%{key}%"]
+    chat_filter = ""
+    if chat_id is not None:
+        chat_filter = "AND cm.chat_id = ?"
+        params.append(chat_id)
+    c.execute(f'''
+        SELECT cm.*, gc.alias AS chat_alias, gc.title AS chat_title
+        FROM chat_members cm
+        LEFT JOIN group_chats gc ON gc.chat_id = cm.chat_id
+        WHERE (
+            lower(cm.username) = lower(?)
+            OR lower(cm.first_name) = lower(?)
+            OR lower(cm.display_name) = lower(?)
+            OR lower(cm.display_name) LIKE lower(?)
+        )
+        {chat_filter}
+        ORDER BY
+            CASE
+                WHEN lower(cm.username) = lower(?) THEN 0
+                WHEN lower(cm.first_name) = lower(?) THEN 1
+                WHEN lower(cm.display_name) = lower(?) THEN 2
+                ELSE 3
+            END,
+            cm.last_seen_at DESC
+        LIMIT 1
+    ''', params + [key, key, key])
+    row = c.fetchone()
+    conn.close()
+    return dict(row) if row else None
 
 
 def _controlled_task_from_row(row):
@@ -736,7 +839,23 @@ def get_employee_alias(alias):
     ''', (alias_key, alias_key, alias_key))
     row = c.fetchone()
     conn.close()
-    return dict(row) if row else None
+    if row:
+        return dict(row)
+    member = find_chat_member(alias_key)
+    if not member:
+        return None
+    return {
+        "alias": alias_key,
+        "user_id": member.get("user_id"),
+        "username": member.get("username"),
+        "display_name": member.get("display_name") or alias,
+        "created_by": None,
+        "created_at": member.get("first_seen_at"),
+        "updated_at": member.get("last_seen_at"),
+        "chat_id": member.get("chat_id"),
+        "chat_alias": member.get("chat_alias"),
+        "chat_title": member.get("chat_title"),
+    }
 
 
 def list_employee_aliases():

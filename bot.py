@@ -7,6 +7,7 @@ from datetime import datetime
 from telegram import BotCommand, Update
 from telegram.ext import (
     ApplicationBuilder,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -40,8 +41,15 @@ from group_utils import (
 from cross_chat import (
     bind_chat_command,
     chat_info_command,
+    format_chat_members_for_prompt,
+    format_group_chats_for_prompt,
+    handle_chat_member_update,
     group_chats_command,
+    maybe_handle_chat_registry_request,
     maybe_handle_private_group_send,
+    remember_chat_administrators,
+    remember_current_group_chat,
+    remember_visible_chat_participants,
     send_to_chat_command,
 )
 from tasks import schedule_task_checker
@@ -315,19 +323,26 @@ async def process_text_request(update: Update, context: ContextTypes.DEFAULT_TYP
     if await maybe_handle_private_group_send(update, context, user_message):
         return
 
+    if await maybe_handle_chat_registry_request(update, context, user_message):
+        return
+
     dialog_key = get_dialog_key(update)
     await update.message.reply_chat_action(action="typing")
 
     prompt = user_message
     team_context = build_team_context(update, user_message)
+    chats_context = format_group_chats_for_prompt()
+    members_context = format_chat_members_for_prompt()
     if is_group_chat(update):
         user = update.effective_user
         author = (user.full_name if user else "участник")
         context_block = f"\n\nОбщий рабочий контекст, известный боту по этому чату/проекту:\n{team_context}" if team_context else ""
+        members_block = f"\n\nИзвестные участники рабочих чатов:\n{members_context}" if members_context else ""
         prompt = (
             f"Сообщение из рабочего группового чата от {author}:\n"
             f"{user_message}"
-            f"{context_block}\n\n"
+            f"{context_block}"
+            f"{members_block}\n\n"
             "Правила командного диалога: ты видишь только сообщения, адресованные тебе, и структурированные записи памяти. "
             "Используй общий контекст, если он помогает, но не копируй дословно ответ, предназначенный другому участнику. "
             "Отвечай на текущий вопрос этого пользователя, при необходимости кратко подсвечивай релевантный контекст: «по этому объекту уже есть задача #...». "
@@ -337,7 +352,17 @@ async def process_text_request(update: Update, context: ContextTypes.DEFAULT_TYP
         prompt = (
             f"Запрос пользователя:\n{user_message}\n\n"
             f"Рабочий контекст из базы задач/договорённостей:\n{team_context}\n\n"
+            f"Известные участники рабочих чатов:\n{members_context or '[нет]'}\n\n"
             "Ответь с учетом структурированного контекста, не выдумывая статусы, которых нет в базе."
+        )
+    elif chats_context or members_context:
+        prompt = (
+            f"Запрос пользователя:\n{user_message}\n\n"
+            f"Известные рабочие чаты, куда бот может отправлять сообщения и напоминания:\n{chats_context or '[нет]'}\n\n"
+            f"Известные участники рабочих чатов:\n{members_context or '[нет]'}\n\n"
+            "Если пользователь спрашивает про чаты или межчатовые поручения, опирайся только на этот список. "
+            "Если пользователь называет человека по имени, используй список участников/username как подсказку. "
+            "Не утверждай, что не участвуешь в чатах, если список не пуст."
         )
 
     if should_use_online_search(user_message):
@@ -365,6 +390,9 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # В группах не обрабатываем обычную переписку. Бот отвечает только,
     # если его упомянули, ответили на его сообщение или использовали команду.
+    if is_group_chat(update):
+        remember_current_group_chat(update)
+        await remember_visible_chat_participants(update, context)
     if is_group_chat(update) and not await is_addressed_to_bot(update, context):
         return
 
@@ -375,6 +403,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await process_text_request(update, context, user_message)
+
+
+async def handle_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat and chat.type in {"group", "supergroup"}:
+        remember_current_group_chat(update)
+        await handle_chat_member_update(update, context)
+        await remember_chat_administrators(update, context)
 
 def main():
     if not TELEGRAM_TOKEN:
@@ -412,6 +448,8 @@ def main():
     app.add_handler(CommandHandler("op_update", op_task_update_command))
     app.add_handler(CommandHandler("subtask", subtask_command))
     app.add_handler(CommandHandler("daily_summary", daily_summary_command))
+    app.add_handler(ChatMemberHandler(handle_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(ChatMemberHandler(handle_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice_message))

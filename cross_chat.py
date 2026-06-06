@@ -8,6 +8,10 @@ from config import ADMIN_IDS, logger
 from database import (
     get_all_group_chats,
     get_group_chat_by_alias,
+    list_chat_members,
+    register_user,
+    upsert_chat_member,
+    upsert_employee_alias,
     upsert_group_chat,
 )
 from group_utils import is_group_chat
@@ -43,6 +47,206 @@ def _format_chat_line(chat: dict) -> str:
     return f"• {alias} — {title}"
 
 
+def _display_name_from_user(user) -> str:
+    if not user:
+        return ""
+    return " ".join(part for part in [user.first_name, user.last_name] if part).strip() or user.username or str(user.id)
+
+
+def remember_chat_member_from_user(chat_id: int, user, status: str = "member") -> bool:
+    if not chat_id or not user or getattr(user, "is_bot", False):
+        return False
+    display_name = _display_name_from_user(user)
+    register_user(user.id, user.username or "", user.first_name or "", user.last_name or "")
+    upsert_chat_member(
+        chat_id=chat_id,
+        user_id=user.id,
+        username=user.username or None,
+        first_name=user.first_name or None,
+        last_name=user.last_name or None,
+        display_name=display_name,
+        status=status,
+    )
+    if user.username:
+        upsert_employee_alias(alias=user.username, username=user.username, display_name=display_name, user_id=user.id)
+    if user.first_name:
+        upsert_employee_alias(alias=user.first_name, username=user.username, display_name=display_name, user_id=user.id)
+    if display_name and display_name != user.first_name:
+        upsert_employee_alias(alias=display_name, username=user.username, display_name=display_name, user_id=user.id)
+    return True
+
+
+def remember_current_group_chat(update: Update, alias: Optional[str] = None) -> bool:
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not is_group_chat(update):
+        return False
+    chat_alias = _clean_alias(alias) if alias else _default_alias_from_title(chat.title, chat.id)
+    if not alias:
+        existing = get_group_chat_by_alias(chat_alias)
+        if existing and int(existing.get("chat_id") or 0) != int(chat.id):
+            chat_alias = f"{chat_alias}_{abs(chat.id)}"
+    upsert_group_chat(
+        chat_id=chat.id,
+        title=chat.title or "Рабочий чат",
+        chat_type=chat.type,
+        alias=chat_alias,
+        registered_by=user.id if user else None,
+    )
+    if user:
+        remember_chat_member_from_user(chat.id, user)
+    return True
+
+
+async def remember_visible_chat_participants(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not chat or not is_group_chat(update):
+        return 0
+    count = 0
+    users = []
+    if update.effective_user:
+        users.append(update.effective_user)
+    if msg and msg.reply_to_message and msg.reply_to_message.from_user:
+        users.append(msg.reply_to_message.from_user)
+    if msg:
+        for user in getattr(msg, "new_chat_members", None) or []:
+            users.append(user)
+        if getattr(msg, "left_chat_member", None):
+            upsert_chat_member(
+                chat_id=chat.id,
+                user_id=msg.left_chat_member.id,
+                username=msg.left_chat_member.username or None,
+                first_name=msg.left_chat_member.first_name or None,
+                last_name=msg.left_chat_member.last_name or None,
+                display_name=_display_name_from_user(msg.left_chat_member),
+                status="left",
+            )
+    seen = set()
+    for user in users:
+        if not user or user.id in seen:
+            continue
+        seen.add(user.id)
+        if remember_chat_member_from_user(chat.id, user):
+            count += 1
+    return count
+
+
+async def remember_chat_administrators(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    chat = update.effective_chat
+    if not chat or not is_group_chat(update):
+        return 0
+    try:
+        admins = await context.bot.get_chat_administrators(chat.id)
+    except Exception as exc:
+        logger.info("Не удалось получить администраторов чата %s: %s", chat.id, exc)
+        return 0
+    count = 0
+    for member in admins:
+        user = getattr(member, "user", None)
+        if remember_chat_member_from_user(chat.id, user, status=getattr(member, "status", "administrator")):
+            count += 1
+    return count
+
+
+async def handle_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    member_update = update.chat_member or update.my_chat_member
+    if not chat or not is_group_chat(update) or not member_update:
+        return
+    remember_current_group_chat(update)
+    user = getattr(member_update.new_chat_member, "user", None)
+    status = getattr(member_update.new_chat_member, "status", "member")
+    remember_chat_member_from_user(chat.id, user, status=status)
+
+
+def format_group_chats_for_prompt(limit: int = 30) -> str:
+    chats = get_all_group_chats()
+    if not chats:
+        return ""
+    lines = []
+    for chat in chats[:limit]:
+        lines.append(f"- {chat.get('alias')}: {chat.get('title') or 'без названия'} (chat_id={chat.get('chat_id')})")
+    return "\n".join(lines)
+
+
+def format_chat_members_for_prompt(limit: int = 80) -> str:
+    members = list_chat_members(limit=limit)
+    if not members:
+        return ""
+    lines = []
+    for member in members:
+        name = member.get("display_name") or member.get("first_name") or member.get("username") or member.get("user_id")
+        username = f"@{member['username']}" if member.get("username") else "без username"
+        chat = member.get("chat_alias") or member.get("chat_title") or member.get("chat_id")
+        status = member.get("status") or "member"
+        lines.append(f"- {name} ({username}), чат: {chat}, status={status}")
+    return "\n".join(lines)
+
+
+def _looks_like_chat_list_request(text: str) -> bool:
+    lowered = (text or "").lower()
+    return (
+        ("чат" in lowered or "групп" in lowered)
+        and any(phrase in lowered for phrase in (
+            "в каких", "где ты", "список", "какие чаты", "чаты где", "чаты в которых", "куда можешь",
+            "куда ты можешь", "куда отправить", "куда написать",
+        ))
+    )
+
+
+def _looks_like_member_list_request(text: str) -> bool:
+    lowered = (text or "").lower()
+    return (
+        any(word in lowered for word in ("участник", "сотрудник", "людей", "кого ты знаешь", "кого знаешь"))
+        and any(word in lowered for word in ("список", "какие", "кто", "покажи", "знаешь"))
+    )
+
+
+async def maybe_handle_chat_registry_request(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
+    if not (_looks_like_chat_list_request(text) or _looks_like_member_list_request(text)):
+        return False
+
+    user = update.effective_user
+    if not _is_admin_user(user.id if user else None):
+        await update.effective_message.reply_text("Список рабочих чатов доступен только администраторам бота из ADMIN_IDS.")
+        return True
+
+    if is_group_chat(update):
+        remember_current_group_chat(update)
+        await remember_visible_chat_participants(update, context)
+
+    if _looks_like_member_list_request(text):
+        members = list_chat_members(chat_id=update.effective_chat.id if is_group_chat(update) else None, limit=80)
+        if not members:
+            await update.effective_message.reply_text(
+                "Пока я не знаю участников. Я начну запоминать людей, когда увижу их сообщения или события добавления в рабочих чатах."
+            )
+            return True
+        lines = []
+        for member in members:
+            name = member.get("display_name") or member.get("first_name") or member.get("username") or member.get("user_id")
+            username = f"@{member['username']}" if member.get("username") else "без username"
+            chat = member.get("chat_alias") or member.get("chat_title") or member.get("chat_id")
+            lines.append(f"• {name} — {username} — {chat}")
+        await update.effective_message.reply_text("Я знаю таких участников:\n" + "\n".join(lines))
+        return True
+
+    chats = get_all_group_chats()
+    if not chats:
+        await update.effective_message.reply_text(
+            "Пока я не знаю ни одного рабочего чата. Добавьте меня в нужные группы и напишите там /bind_chat короткое_имя."
+        )
+        return True
+
+    await update.effective_message.reply_text(
+        "Я знаю такие рабочие чаты:\n"
+        + "\n".join(_format_chat_line(c) for c in chats)
+        + "\n\nДля межчатового поручения можно писать, например: «напиши в чат проект_лигoвский, что нужен статус по расчетам»."
+    )
+    return True
+
+
 async def bind_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Привязать текущий групповой чат к короткому имени/алиасу."""
     msg = update.effective_message
@@ -63,13 +267,7 @@ async def bind_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await msg.reply_text("Укажите короткое имя чата, например: /bind_chat рабочий")
         return
 
-    upsert_group_chat(
-        chat_id=chat.id,
-        title=chat.title or "Рабочий чат",
-        chat_type=chat.type,
-        alias=alias,
-        registered_by=user.id if user else None,
-    )
+    remember_current_group_chat(update, alias=alias)
     await msg.reply_text(
         f"✅ Этот чат привязан как: {alias}\n"
         f"Теперь в личке можно писать, например:\n"

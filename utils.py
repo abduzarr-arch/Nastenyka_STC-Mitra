@@ -22,6 +22,7 @@ from database import add_to_conversation, get_conversation_history
 from reminders import handle_reminder_request
 from excel_utils import handle_excel_document, is_excel_file
 from docx_utils import handle_word_document, is_word_file
+from cross_chat import remember_current_group_chat, remember_visible_chat_participants
 from group_utils import clean_group_trigger_text, get_dialog_key, is_addressed_to_bot, is_group_chat
 from internet_search import answer_online, should_use_online_search
 
@@ -88,6 +89,9 @@ def ask_deepseek(prompt: str, user_id: str) -> str:
 
 
 async def handle_voice_message(update, context):
+    if is_group_chat(update):
+        remember_current_group_chat(update)
+        await remember_visible_chat_participants(update, context)
     """Распознает голосовое сообщение через OpenAI Whisper и отправляет текст в DeepSeek."""
     if is_group_chat(update) and not await is_addressed_to_bot(update, context):
         return
@@ -185,6 +189,9 @@ def analyze_image_with_openai(image_path: str, question: str, user_id: str, mime
 
 
 async def handle_photo_message(update, context):
+    if is_group_chat(update):
+        remember_current_group_chat(update)
+        await remember_visible_chat_participants(update, context)
     """Анализирует фото из Telegram через OpenAI vision-модель."""
     if not update.message:
         return
@@ -222,6 +229,9 @@ async def handle_photo_message(update, context):
 
 
 async def handle_image_document(update, context):
+    if is_group_chat(update):
+        remember_current_group_chat(update)
+        await remember_visible_chat_participants(update, context)
     """Анализирует изображение, отправленное как файл/документ."""
     doc = update.message.document
     file_name = doc.file_name or "image"
@@ -253,6 +263,9 @@ async def handle_image_document(update, context):
 
 
 async def handle_document(update, context):
+    if is_group_chat(update):
+        remember_current_group_chat(update)
+        await remember_visible_chat_participants(update, context)
     """Извлекает текст из PDF/DOCX/TXT, анализирует изображения и обрабатывает Excel-файлы."""
     if is_group_chat(update) and not await is_addressed_to_bot(update, context):
         return
