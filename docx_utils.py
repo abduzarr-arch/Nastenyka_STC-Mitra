@@ -16,7 +16,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.text.paragraph import Paragraph
 
-from config import DEEPSEEK_API_KEY, DEEPSEEK_MODEL, MAX_RESPONSE_TOKENS, logger
+from config import DEEPSEEK_API_KEY, DEEPSEEK_MODEL, logger
 from database import add_to_conversation
 from group_utils import get_dialog_key
 
@@ -248,13 +248,18 @@ def _call_deepseek_for_word(system_prompt: str, user_prompt: str, max_tokens: in
     if not DEEPSEEK_API_KEY:
         raise WordProcessingError("Не настроен DEEPSEEK_API_KEY")
 
+    try:
+        word_token_limit = int(os.getenv("WORD_MAX_RESPONSE_TOKENS", "8000"))
+    except ValueError:
+        word_token_limit = 8000
+
     data = {
         "model": DEEPSEEK_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "max_tokens": min(MAX_RESPONSE_TOKENS, max_tokens),
+        "max_tokens": max(512, min(word_token_limit, max_tokens)),
         "temperature": temperature,
     }
     headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
@@ -265,9 +270,11 @@ def _call_deepseek_for_word(system_prompt: str, user_prompt: str, max_tokens: in
         choice = payload["choices"][0]
         message = choice.get("message") or {}
         content = message.get("content") or ""
+        finish_reason = choice.get("finish_reason") or "unknown"
         if not content.strip():
-            finish_reason = choice.get("finish_reason") or "unknown"
             raise WordProcessingError(f"ИИ вернул пустой ответ (finish_reason={finish_reason})")
+        if finish_reason == "length" and not content.strip().endswith("}"):
+            raise WordProcessingError("ИИ не успел завершить JSON-план правок (finish_reason=length)")
         return content
     except requests.HTTPError as e:
         detail = (getattr(e.response, "text", "") or "")[:500]
@@ -316,7 +323,12 @@ def analyze_word_with_ai(path: str, file_name: str, question: str, user_id: str,
 
 
 def build_word_patch_with_ai(path: str, file_name: str, request_text: str, reference_context: str = "") -> Dict[str, Any]:
-    document_text = document_to_text(path, max_paragraphs=320, max_tables=20, max_table_rows=60)
+    document_text = document_to_text(path, max_paragraphs=220, max_tables=12, max_table_rows=35, max_cell_chars=900)
+    reference_context = _clip_text_at_boundary(
+        reference_context or "",
+        14000,
+        "\n... [контекст ТЗ/КП сокращен из-за лимита]",
+    )
     system_prompt = """
 Ты преобразуешь просьбу пользователя о правке Word/DOCX в безопасный JSON-план.
 Отвечай ТОЛЬКО валидным JSON без markdown.
@@ -360,7 +372,7 @@ def build_word_patch_with_ai(path: str, file_name: str, request_text: str, refer
 
     user_prompt = make_user_prompt(reference_context)
     try:
-        raw = _call_deepseek_for_word(system_prompt, user_prompt, max_tokens=3600, temperature=0.0)
+        raw = _call_deepseek_for_word(system_prompt, user_prompt, max_tokens=7000, temperature=0.0)
     except WordProcessingError as first_error:
         reduced_context = _clip_text_at_boundary(
             reference_context,
@@ -368,7 +380,7 @@ def build_word_patch_with_ai(path: str, file_name: str, request_text: str, refer
             "\n... [контекст ТЗ/КП сокращен для повторной попытки]",
         ) if reference_context else ""
         try:
-            raw = _call_deepseek_for_word(system_prompt, make_user_prompt(reduced_context), max_tokens=3600, temperature=0.0)
+            raw = _call_deepseek_for_word(system_prompt, make_user_prompt(reduced_context), max_tokens=7000, temperature=0.0)
         except WordProcessingError:
             simple_system_prompt = """
 Ты редактируешь DOCX по просьбе пользователя. Ответь только валидным JSON без markdown.
@@ -387,12 +399,12 @@ def build_word_patch_with_ai(path: str, file_name: str, request_text: str, refer
 """.strip()
             simple_request = (
                 "Сделай минимальный JSON-план правок договора по ТЗ/КП.\n\n"
-                f"DOCX:\n{_clip_text_at_boundary(document_text, 18000)}\n\n"
-                f"ТЗ/КП:\n{_clip_text_at_boundary(reduced_context, 7000)}\n\n"
+                f"DOCX:\n{_clip_text_at_boundary(document_text, 12000)}\n\n"
+                f"ТЗ/КП:\n{_clip_text_at_boundary(reduced_context, 5000)}\n\n"
                 f"Просьба:\n{request_text}\n\n"
                 f"Первичная ошибка модели: {first_error}"
             )
-            raw = _call_deepseek_for_word(simple_system_prompt, simple_request, max_tokens=2800, temperature=0.1)
+            raw = _call_deepseek_for_word(simple_system_prompt, simple_request, max_tokens=5000, temperature=0.1)
     patch = _extract_json(raw)
     if not isinstance(patch, dict):
         raise WordProcessingError("ИИ вернул не объект JSON")
