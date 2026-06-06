@@ -2,6 +2,7 @@ import base64
 import mimetypes
 import os
 import tempfile
+import time
 from asyncio import to_thread
 
 import requests
@@ -26,6 +27,22 @@ from internet_search import answer_online, should_use_online_search
 
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+
+def remember_reference_document(context, dialog_key: str, file_name: str, text: str, max_docs: int = 5) -> None:
+    """Запоминает PDF/TXT как рабочий контекст для правки Word в этом диалоге."""
+    if not text or not hasattr(context, "user_data"):
+        return
+    refs_by_dialog = context.user_data.setdefault("reference_documents_by_dialog", {})
+    items = refs_by_dialog.setdefault(str(dialog_key), [])
+    items.append(
+        {
+            "file_name": file_name or "document",
+            "text": text[:12000],
+            "saved_at": time.time(),
+        }
+    )
+    refs_by_dialog[str(dialog_key)] = items[-max_docs:]
 
 
 def ask_deepseek(prompt: str, user_id: str) -> str:
@@ -292,9 +309,11 @@ async def handle_document(update, context):
                 text_content = "\n".join(page.get_text() for page in pdf)
 
         if text_content:
+            dialog_key = get_dialog_key(update)
+            remember_reference_document(context, dialog_key, file_name, text_content)
             if len(text_content) > 3000:
                 text_content = text_content[:3000] + "..."
-            add_to_conversation(get_dialog_key(update), "user", f"[Файл {file_name}]:\n{text_content}")
+            add_to_conversation(dialog_key, "user", f"[Файл {file_name}]:\n{text_content}")
             await update.message.reply_text(f"Файл {file_name} получен и прочитан. Спрашивайте о его содержимом.")
         else:
             await update.message.reply_text("Не удалось извлечь текст из файла.")

@@ -138,6 +138,61 @@ def _get_recent_word_context(context, dialog_key: str, max_age_seconds: int = 24
     return info
 
 
+def _get_reference_documents(context, dialog_key: str, max_docs: int = 5) -> List[Dict[str, Any]]:
+    if not hasattr(context, "user_data"):
+        return []
+    refs_by_dialog = context.user_data.get("reference_documents_by_dialog", {})
+    items = refs_by_dialog.get(str(dialog_key), [])
+    return list(items[-max_docs:])
+
+
+def _remember_reference_document(context, dialog_key: str, file_name: str, text: str, max_docs: int = 8) -> None:
+    if not text or not hasattr(context, "user_data"):
+        return
+    refs_by_dialog = context.user_data.setdefault("reference_documents_by_dialog", {})
+    items = refs_by_dialog.setdefault(str(dialog_key), [])
+    items.append(
+        {
+            "file_name": file_name or "document.docx",
+            "text": text[:12000],
+            "saved_at": time_module.time(),
+        }
+    )
+    refs_by_dialog[str(dialog_key)] = items[-max_docs:]
+
+
+def _clip_text_at_boundary(text: str, limit: int, suffix: str = "\n... [текст обрезан]") -> str:
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    boundary = max(cut.rfind("\n"), cut.rfind(". "), cut.rfind("; "), cut.rfind(", "), cut.rfind(" "))
+    if boundary > max(0, limit - 300):
+        cut = cut[:boundary].rstrip()
+    return cut.rstrip() + suffix
+
+
+def _format_reference_documents(refs: List[Dict[str, Any]], limit: int = 22000) -> str:
+    if not refs:
+        return ""
+    parts: List[str] = []
+    used = 0
+    for idx, ref in enumerate(refs, start=1):
+        name = str(ref.get("file_name") or f"reference_{idx}")
+        text = str(ref.get("text") or "").strip()
+        if not text:
+            continue
+        header = f"\n=== Reference document {idx}: {name} ===\n"
+        remaining = limit - used - len(header)
+        if remaining <= 0:
+            break
+        chunk = _clip_text_at_boundary(text, remaining, "\n... [часть опорного документа скрыта из-за лимита контекста]")
+        parts.append(header + chunk)
+        used += len(header) + len(chunk)
+        if used >= limit:
+            break
+    return "\n".join(parts).strip()
+
+
 def _is_word_followup_request(context, text: str, dialog_key: str) -> bool:
     if not text:
         return False
@@ -153,10 +208,10 @@ def _is_word_followup_request(context, text: str, dialog_key: str) -> bool:
 def _trim_text(text: str, limit: int = 55000) -> str:
     if len(text) <= limit:
         return text
-    return text[:limit] + "\n... [текст документа обрезан из-за размера файла]"
+    return _clip_text_at_boundary(text, limit, "\n... [текст документа обрезан из-за размера файла]")
 
 
-def document_to_text(path: str, max_paragraphs: int = 260, max_tables: int = 15, max_table_rows: int = 40) -> str:
+def document_to_text(path: str, max_paragraphs: int = 260, max_tables: int = 15, max_table_rows: int = 40, max_cell_chars: int = 1200) -> str:
     """Текстовое представление DOCX: абзацы + таблицы."""
     doc = Document(path)
     parts: List[str] = []
@@ -179,7 +234,7 @@ def document_to_text(path: str, max_paragraphs: int = 260, max_tables: int = 15,
             values = []
             for cell in row.cells:
                 cell_text = " ".join((p.text or "").strip() for p in cell.paragraphs if (p.text or "").strip())
-                values.append(cell_text[:180])
+                values.append(_clip_text_at_boundary(cell_text, max_cell_chars, " ... [ячейка обрезана из-за лимита]"))
             parts.append(" | ".join(values))
         if len(table.rows) > max_table_rows:
             parts.append(f"... показаны первые {max_table_rows} строк таблицы")
@@ -224,21 +279,27 @@ def _extract_json(text: str) -> Dict[str, Any]:
         raise
 
 
-def analyze_word_with_ai(path: str, file_name: str, question: str, user_id: str) -> str:
+def analyze_word_with_ai(path: str, file_name: str, question: str, user_id: str, reference_context: str = "") -> str:
     text = document_to_text(path)
     question = (question or "Кратко опиши, что находится в Word-документе.").strip()
     system_prompt = (
         "Ты — ассистент, который анализирует Word/DOCX документы. Отвечай на русском. "
-        "Используй только текст документа, который дан пользователем. Если часть документа не видна или это скан, честно скажи об этом."
+        "Используй текст Word-документа и дополнительные документы-основания, если они переданы. "
+        "Если часть документа не видна или это скан, честно скажи об этом."
     )
-    user_prompt = f"Файл: {file_name}\n\nТекст DOCX:\n{text}\n\nВопрос пользователя:\n{question}"
+    user_prompt = (
+        f"Файл: {file_name}\n\n"
+        f"Текст DOCX:\n{text}\n\n"
+        f"Дополнительные документы/контекст (ТЗ, КП, PDF, TXT), если были переданы:\n{reference_context or '[нет]'}\n\n"
+        f"Вопрос пользователя:\n{question}"
+    )
     answer = _call_deepseek_for_word(system_prompt, user_prompt, max_tokens=3000, temperature=0.2)
     add_to_conversation(user_id, "user", f"[Word {file_name}] {question}\n{text[:5000]}")
     add_to_conversation(user_id, "assistant", answer)
     return answer
 
 
-def build_word_patch_with_ai(path: str, file_name: str, request_text: str) -> Dict[str, Any]:
+def build_word_patch_with_ai(path: str, file_name: str, request_text: str, reference_context: str = "") -> Dict[str, Any]:
     document_text = document_to_text(path, max_paragraphs=320, max_tables=20, max_table_rows=60)
     system_prompt = """
 Ты преобразуешь просьбу пользователя о правке Word/DOCX в безопасный JSON-план.
@@ -268,11 +329,17 @@ def build_word_patch_with_ai(path: str, file_name: str, request_text: str) -> Di
 Правила:
 - Если пользователь просит просто проанализировать документ, верни actions: [] и message с кратким пояснением.
 - Если пользователь просит добавить этапность оплат, найди раздел про оплату/расчеты. Если такого раздела не видно — добавь новый раздел в конец: «Этапность оплат».
+- Если пользователь просит изменить договор по ТЗ/КП/PDF и такие дополнительные документы переданы ниже, используй их как основание для правок. Не проси прислать ТЗ/КП повторно, если в блоке дополнительных документов уже есть релевантный текст.
 - Для договора сохраняй деловой юридический стиль, но не утверждай, что это финальная юридическая редакция.
 - Не удаляй большие фрагменты, если пользователь явно не просит.
 - Не используй макросы, внешние ссылки и произвольный код.
 """.strip()
-    user_prompt = f"Файл: {file_name}\n\nТекст DOCX:\n{document_text}\n\nПросьба пользователя:\n{request_text}"
+    user_prompt = (
+        f"Файл: {file_name}\n\n"
+        f"Текст DOCX:\n{document_text}\n\n"
+        f"Дополнительные документы/контекст (ТЗ, КП, PDF, TXT), если были переданы:\n{reference_context or '[нет]'}\n\n"
+        f"Просьба пользователя:\n{request_text}"
+    )
     raw = _call_deepseek_for_word(system_prompt, user_prompt, max_tokens=3600, temperature=0.0)
     patch = _extract_json(raw)
     if not isinstance(patch, dict):
@@ -522,14 +589,14 @@ def apply_word_patch(input_path: str, output_path: str, patch: Dict[str, Any]) -
     return changes
 
 
-def edit_word_with_ai(input_path: str, file_name: str, request_text: str, user_id: str) -> Tuple[Optional[str], str, List[str]]:
-    patch = build_word_patch_with_ai(input_path, file_name, request_text)
+def edit_word_with_ai(input_path: str, file_name: str, request_text: str, user_id: str, reference_context: str = "") -> Tuple[Optional[str], str, List[str]]:
+    patch = build_word_patch_with_ai(input_path, file_name, request_text, reference_context)
     if patch.get("need_clarification"):
         return None, patch.get("message") or "Нужно уточнить, что именно изменить в Word-файле.", []
 
     actions = patch.get("actions", [])
     if not actions:
-        answer = analyze_word_with_ai(input_path, file_name, request_text, user_id)
+        answer = analyze_word_with_ai(input_path, file_name, request_text, user_id, reference_context)
         return None, answer, []
 
     base = Path(file_name).stem or "document"
@@ -615,9 +682,12 @@ async def handle_word_document(update, context) -> None:
 
         user_id = get_dialog_key(update)
         remember_word_file(context, update.effective_chat.id, tmp_path, file_name, user_id)
+        remembered_text = document_to_text(tmp_path, max_paragraphs=260, max_tables=15, max_table_rows=40)
+        _remember_reference_document(context, user_id, file_name, remembered_text)
+        reference_context = _format_reference_documents(_get_reference_documents(context, user_id))
 
         if not user_request:
-            text = document_to_text(tmp_path, max_paragraphs=40, max_tables=4)
+            text = remembered_text
             add_to_conversation(user_id, "user", f"[Word {file_name}]\n{text[:5000]}")
             await update.message.reply_text(
                 f"Word-файл {file_name} получен и прочитан.\n"
@@ -630,7 +700,7 @@ async def handle_word_document(update, context) -> None:
             return
 
         if looks_like_word_edit_request(user_request):
-            out_path, message, changes = await asyncio.to_thread(edit_word_with_ai, tmp_path, file_name, user_request, user_id)
+            out_path, message, changes = await asyncio.to_thread(edit_word_with_ai, tmp_path, file_name, user_request, user_id, reference_context)
             if out_path:
                 remember_word_file(context, update.effective_chat.id, out_path, os.path.basename(out_path), user_id)
                 text_msg = message
@@ -642,7 +712,7 @@ async def handle_word_document(update, context) -> None:
             else:
                 await update.message.reply_text(message)
         else:
-            answer = await asyncio.to_thread(analyze_word_with_ai, tmp_path, file_name, user_request, user_id)
+            answer = await asyncio.to_thread(analyze_word_with_ai, tmp_path, file_name, user_request, user_id, reference_context)
             await update.message.reply_text(answer)
 
     except Exception as e:
@@ -672,13 +742,14 @@ async def handle_word_followup_text(update, context, text: str) -> bool:
     user_id = dialog_key
     input_path = info["path"]
     file_name = info.get("file_name") or "document.docx"
+    reference_context = _format_reference_documents(_get_reference_documents(context, dialog_key))
     out_path = None
 
     try:
         await update.message.reply_chat_action(action="typing")
         if looks_like_word_edit_request(request_text):
             await update.message.reply_text("Поняла. Вношу изменения в последний Word-файл и пришлю новую копию.")
-            out_path, message, changes = await asyncio.to_thread(edit_word_with_ai, input_path, file_name, request_text, user_id)
+            out_path, message, changes = await asyncio.to_thread(edit_word_with_ai, input_path, file_name, request_text, user_id, reference_context)
             if out_path:
                 remember_word_file(context, update.effective_chat.id, out_path, os.path.basename(out_path), dialog_key)
                 text_msg = message
@@ -690,7 +761,7 @@ async def handle_word_followup_text(update, context, text: str) -> bool:
             else:
                 await update.message.reply_text(message)
         else:
-            answer = await asyncio.to_thread(analyze_word_with_ai, input_path, file_name, request_text, user_id)
+            answer = await asyncio.to_thread(analyze_word_with_ai, input_path, file_name, request_text, user_id, reference_context)
             await update.message.reply_text(answer)
         context.user_data.get("awaiting_word_request_by_dialog", {}).pop(dialog_key, None)
         return True
