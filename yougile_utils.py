@@ -186,6 +186,30 @@ def build_yougile_structure_report() -> str:
     return "\n".join(lines)
 
 
+def build_yougile_projects_report() -> str:
+    projects = yougile_projects(limit=100)
+    if not projects:
+        return "В YouGile пока не нашла проектов."
+
+    lines = [f"В YouGile вижу {len(projects)} проектов:"]
+    for index, project in enumerate(projects, start=1):
+        name = _text_value(project, "title", "name") or "без названия"
+        lines.append(f"{index}. {name}")
+    return "\n".join(lines)
+
+
+def build_yougile_boards_report() -> str:
+    boards = yougile_boards(limit=100)
+    if not boards:
+        return "В YouGile пока не нашла досок."
+
+    lines = [f"В YouGile вижу {len(boards)} досок:"]
+    for index, board in enumerate(boards, start=1):
+        name = _text_value(board, "title", "name") or "без названия"
+        lines.append(f"{index}. {name}")
+    return "\n".join(lines)
+
+
 def build_yougile_summary() -> str:
     tasks = yougile_tasks(limit=200)
     if not tasks:
@@ -289,8 +313,12 @@ async def maybe_handle_yougile_request(update: Update, context: ContextTypes.DEF
 
     lowered = text.lower()
     try:
-        if any(word in lowered for word in ("структур", "доск", "колон", "проект")):
+        if any(word in lowered for word in ("структур", "колон", "id", "айди", "идентификатор")):
             report = await asyncio.to_thread(build_yougile_structure_report)
+        elif "проект" in lowered:
+            report = await asyncio.to_thread(build_yougile_projects_report)
+        elif "доск" in lowered:
+            report = await asyncio.to_thread(build_yougile_boards_report)
         elif any(word in lowered for word in ("покажи", "список", "какие", "задач", "статус", "сводк")):
             report = await asyncio.to_thread(build_yougile_tasks_report, "", 25)
         else:
