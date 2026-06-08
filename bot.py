@@ -79,6 +79,15 @@ from operations import (
     tasks_report_command,
 )
 from utils import ask_deepseek, handle_document, handle_photo_message, handle_voice_message
+from yougile_utils import (
+    maybe_handle_yougile_request,
+    schedule_yougile_checker,
+    yougile_bot_commands,
+    yougile_create_task_command,
+    yougile_status_command,
+    yougile_structure_command,
+    yougile_tasks_command,
+)
 
 
 def _looks_like_drafting_request(text: str) -> bool:
@@ -126,6 +135,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         BotCommand("search", "Поиск в интернете"),
         BotCommand("ask", "Задать вопрос боту в группе"),
         *operational_bot_commands(),
+        *yougile_bot_commands(),
     ])
 
 
@@ -338,6 +348,9 @@ async def process_text_request(update: Update, context: ContextTypes.DEFAULT_TYP
     if await maybe_handle_chat_registry_request(update, context, user_message):
         return
 
+    if await maybe_handle_yougile_request(update, context, user_message):
+        return
+
     dialog_key = get_dialog_key(update)
     await update.message.reply_chat_action(action="typing")
 
@@ -473,6 +486,10 @@ def main():
     app.add_handler(CommandHandler("op_update", op_task_update_command))
     app.add_handler(CommandHandler("subtask", subtask_command))
     app.add_handler(CommandHandler("daily_summary", daily_summary_command))
+    app.add_handler(CommandHandler("yg_status", yougile_status_command))
+    app.add_handler(CommandHandler("yg_structure", yougile_structure_command))
+    app.add_handler(CommandHandler("yg_tasks", yougile_tasks_command))
+    app.add_handler(CommandHandler("yg_create", yougile_create_task_command))
     app.add_handler(ChatMemberHandler(handle_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(ChatMemberHandler(handle_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -484,6 +501,7 @@ def main():
     schedule_reminder_checker(app)
     schedule_controlled_tasks_checker(app)
     schedule_operational_checker(app)
+    schedule_yougile_checker(app)
 
     logger.info("Бот Настенька запущен")
     app.run_polling()
