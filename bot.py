@@ -81,6 +81,15 @@ from operations import (
 from utils import ask_deepseek, handle_document, handle_photo_message, handle_voice_message
 
 
+def _looks_like_drafting_request(text: str) -> bool:
+    lowered = (text or "").lower()
+    write_markers = ("напиши", "составь", "подготовь", "сформулируй", "сделай текст", "набросай", "письмо")
+    document_markers = ("письмо", "ответ", "заказчик", "клиент", "коммерческое предложение", "кп", "объяснить")
+    if any(marker in lowered for marker in write_markers) and any(marker in lowered for marker in document_markers):
+        return True
+    return "надо объяснить заказчику" in lowered or "текст письма" in lowered or "ответ заказчику" in lowered
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
@@ -295,11 +304,14 @@ async def process_text_request(update: Update, context: ContextTypes.DEFAULT_TYP
     if is_group_chat(update) and await maybe_handle_group_agreement(update, context, user_message):
         return
 
-    if await maybe_handle_operational_request(update, context, user_message):
-        return
+    is_drafting_request = _looks_like_drafting_request(user_message)
 
-    if await maybe_handle_control_request(update, context, user_message):
-        return
+    if not is_drafting_request:
+        if await maybe_handle_operational_request(update, context, user_message):
+            return
+
+        if await maybe_handle_control_request(update, context, user_message):
+            return
 
     if await handle_reminder_request(update, context, user_message):
         return
@@ -330,10 +342,23 @@ async def process_text_request(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_chat_action(action="typing")
 
     prompt = user_message
+    if is_drafting_request:
+        prompt = (
+            "Пользователь просит подготовить деловой текст/письмо. "
+            "Не ставь задачу и не спрашивай ответственного. "
+            "Сразу дай готовый текст письма на русском языке, в деловом стиле, с темой письма при необходимости. "
+            "Если есть технические риски, сформулируй их понятно для заказчика без лишней категоричности.\n\n"
+            f"Запрос пользователя:\n{user_message}"
+        )
     team_context = build_team_context(update, user_message)
     chats_context = format_group_chats_for_prompt()
     members_context = format_chat_members_for_prompt()
-    if is_group_chat(update):
+    if is_drafting_request:
+        if team_context:
+            prompt += f"\n\nРабочий контекст из базы задач/договорённостей:\n{team_context}"
+        if members_context:
+            prompt += f"\n\nИзвестные участники рабочих чатов:\n{members_context}"
+    elif is_group_chat(update):
         user = update.effective_user
         author = (user.full_name if user else "участник")
         context_block = f"\n\nОбщий рабочий контекст, известный боту по этому чату/проекту:\n{team_context}" if team_context else ""
