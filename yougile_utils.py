@@ -114,6 +114,22 @@ def _text_value(item: dict, *keys: str) -> str:
     return ""
 
 
+def _item_id(item: dict) -> str:
+    return _text_value(item, "id")
+
+
+def _nested_id(item: dict, *keys: str) -> str:
+    for key in keys:
+        value = item.get(key)
+        if isinstance(value, dict):
+            nested_id = _item_id(value)
+            if nested_id:
+                return nested_id
+        elif value is not None:
+            return str(value)
+    return ""
+
+
 def _task_title(task: dict) -> str:
     return _text_value(task, "title", "name") or "без названия"
 
@@ -129,6 +145,18 @@ def _task_status(task: dict) -> str:
     return _text_value(task, "columnId", "status", "archived") or "без статуса"
 
 
+def _task_column_id(task: dict) -> str:
+    return _text_value(task, "columnId", "column_id") or _nested_id(task, "column")
+
+
+def _board_project_id(board: dict) -> str:
+    return _text_value(board, "projectId", "project_id") or _nested_id(board, "project")
+
+
+def _column_board_id(column: dict) -> str:
+    return _text_value(column, "boardId", "board_id") or _nested_id(column, "board")
+
+
 def _task_deadline(task: dict) -> str:
     deadline = task.get("deadline")
     if isinstance(deadline, dict):
@@ -136,12 +164,20 @@ def _task_deadline(task: dict) -> str:
     return _text_value(task, "deadline", "dueDate", "date")
 
 
-def _format_task_line(task: dict) -> str:
+def _format_task_line(task: dict, column_names: Optional[Dict[str, str]] = None, show_id: bool = False) -> str:
     title = _task_title(task)
-    status = _task_status(task)
+    column_id = _task_column_id(task)
+    status = (column_names or {}).get(column_id) or _task_status(task)
     deadline = _task_deadline(task)
-    suffix = f" · срок: {deadline}" if deadline else ""
-    return f"#{_task_id(task)} {title} · {status}{suffix}"
+    parts = []
+    if show_id:
+        parts.append(f"#{_task_id(task)}")
+    parts.append(title)
+    if status:
+        parts.append(status)
+    if deadline:
+        parts.append(f"срок: {deadline}")
+    return " · ".join(parts)
 
 
 def _matches_task(task: dict, query: str) -> bool:
@@ -151,14 +187,24 @@ def _matches_task(task: dict, query: str) -> bool:
     return all(part in haystack for part in query.lower().split())
 
 
+def _column_names(columns: Optional[List[dict]] = None) -> Dict[str, str]:
+    source = columns if columns is not None else yougile_columns(limit=300)
+    return {
+        _item_id(column): (_text_value(column, "title", "name") or "без названия")
+        for column in source
+        if _item_id(column)
+    }
+
+
 def build_yougile_tasks_report(query: str = "", limit: int = 25) -> str:
     tasks = [task for task in yougile_tasks(limit=200) if _matches_task(task, query)]
     if not tasks:
         return "В YouGile не нашла задач по этому запросу." if query else "В YouGile пока не нашла задач."
 
-    lines = [f"Задачи YouGile: {len(tasks)} найдено"]
-    for task in tasks[:limit]:
-        lines.append(_format_task_line(task))
+    column_names = _column_names()
+    lines = [f"Нашла задач в YouGile: {len(tasks)}"]
+    for index, task in enumerate(tasks[:limit], start=1):
+        lines.append(f"{index}. {_format_task_line(task, column_names)}")
     if len(tasks) > limit:
         lines.append(f"... показаны первые {limit} из {len(tasks)}")
     return "\n".join(lines)
@@ -207,6 +253,75 @@ def build_yougile_boards_report() -> str:
     for index, board in enumerate(boards, start=1):
         name = _text_value(board, "title", "name") or "без названия"
         lines.append(f"{index}. {name}")
+    return "\n".join(lines)
+
+
+def _find_projects_by_name(projects: List[dict], query: str) -> List[dict]:
+    normalized = (query or "").strip().lower()
+    if not normalized:
+        return []
+
+    exact = [
+        project for project in projects
+        if (_text_value(project, "title", "name") or "").strip().lower() == normalized
+    ]
+    if exact:
+        return exact
+
+    return [
+        project for project in projects
+        if normalized in (_text_value(project, "title", "name") or "").lower()
+    ]
+
+
+def build_yougile_project_tasks_report(project_query: str, limit: int = 40) -> str:
+    projects = yougile_projects(limit=150)
+    matched_projects = _find_projects_by_name(projects, project_query)
+    if not matched_projects:
+        return (
+            f"Не нашла в YouGile проект «{project_query}».\n"
+            "Могу показать список проектов командой: какие проекты в YouGile"
+        )
+
+    boards = yougile_boards(limit=300)
+    columns = yougile_columns(limit=500)
+    tasks = yougile_tasks(limit=500)
+
+    project_ids = {_item_id(project) for project in matched_projects if _item_id(project)}
+    project_names = [_text_value(project, "title", "name") or "без названия" for project in matched_projects]
+
+    board_ids = {
+        _item_id(board) for board in boards
+        if _item_id(board) and _board_project_id(board) in project_ids
+    }
+    column_ids = {
+        _item_id(column) for column in columns
+        if _item_id(column) and _column_board_id(column) in board_ids
+    }
+    column_names = _column_names(columns)
+
+    project_tasks = [
+        task for task in tasks
+        if _task_column_id(task) in column_ids
+        or _nested_id(task, "project") in project_ids
+        or _nested_id(task, "board") in board_ids
+    ]
+
+    if not project_tasks and len(project_query.strip()) >= 2:
+        project_tasks = [task for task in tasks if _matches_task(task, project_query)]
+
+    project_label = ", ".join(project_names[:3])
+    if len(project_names) > 3:
+        project_label += f" и еще {len(project_names) - 3}"
+
+    if not project_tasks:
+        return f"Проект «{project_label}» нашла, но задач внутри него пока не увидела."
+
+    lines = [f"По проекту «{project_label}» вижу {len(project_tasks)} задач:"]
+    for index, task in enumerate(project_tasks[:limit], start=1):
+        lines.append(f"{index}. {_format_task_line(task, column_names)}")
+    if len(project_tasks) > limit:
+        lines.append(f"... показаны первые {limit} из {len(project_tasks)}")
     return "\n".join(lines)
 
 
@@ -307,13 +422,34 @@ def looks_like_yougile_request(text: str) -> bool:
     return "yougile" in lowered or "юджайл" in lowered or "югейл" in lowered
 
 
+def _extract_project_task_query(text: str) -> str:
+    lowered = (text or "").lower()
+    if "кп" in lowered:
+        return "КП"
+
+    markers = ("по проекту", "в проекте", "проект")
+    for marker in markers:
+        if marker in lowered:
+            tail = lowered.split(marker, 1)[1].strip(" :,.!?")
+            stop_words = ("в yougile", "в юджайле", "на yougile", "на юджайле", "задачи", "задач")
+            for stop_word in stop_words:
+                tail = tail.replace(stop_word, "")
+            tail = tail.strip(" :,.!?")
+            if tail and tail not in {"ы", "а", "ов"}:
+                return tail
+    return ""
+
+
 async def maybe_handle_yougile_request(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
     if not looks_like_yougile_request(text):
         return False
 
     lowered = text.lower()
     try:
-        if any(word in lowered for word in ("структур", "колон", "id", "айди", "идентификатор")):
+        project_task_query = _extract_project_task_query(text)
+        if project_task_query and any(word in lowered for word in ("какие", "покажи", "список", "задач", "видишь")):
+            report = await asyncio.to_thread(build_yougile_project_tasks_report, project_task_query, 40)
+        elif any(word in lowered for word in ("структур", "колон", "id", "айди", "идентификатор")):
             report = await asyncio.to_thread(build_yougile_structure_report)
         elif "проект" in lowered:
             report = await asyncio.to_thread(build_yougile_projects_report)
