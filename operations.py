@@ -388,6 +388,23 @@ def looks_like_status_request(text: str) -> bool:
     return any(word in lowered for word in STATUS_WORDS) and any(word in lowered for word in ("задач", "объект", "проект", "сотруд", "дима", "егор", "вадим", "все", "сегодня", "недел", "рпз", "смет", "расчет", "расчёт"))
 
 
+def looks_like_manager_summary_request(text: str) -> bool:
+    lowered = (text or "").lower()
+    direct_phrases = (
+        "сводка руководителя",
+        "дай сводку",
+        "дай отчёт",
+        "дай отчет",
+        "покажи сводку",
+        "сформируй сводку",
+        "что контролировать",
+        "что горит",
+        "где риски",
+        "без статуса",
+    )
+    return any(phrase in lowered for phrase in direct_phrases)
+
+
 def looks_like_subtask_request(text: str) -> bool:
     lowered = (text or "").lower()
     return any(word in lowered for word in SUBTASK_WORDS) and ("задач" in lowered or "рпз" in lowered or re.search(r"#\d+", lowered))
@@ -858,9 +875,17 @@ async def maybe_handle_operational_request(update: Update, context: ContextTypes
             return True
 
     # Статус/сводки.
+    if looks_like_manager_summary_request(text):
+        from internet_search import split_telegram_text
+        for part in split_telegram_text(build_manager_summary()):
+            await update.effective_message.reply_text(part)
+        return True
+
     if looks_like_status_request(text):
         if _contains_any(text, MANAGER_SUMMARY_WORDS):
-            await update.effective_message.reply_text(build_manager_summary())
+            from internet_search import split_telegram_text
+            for part in split_telegram_text(build_manager_summary()):
+                await update.effective_message.reply_text(part)
         else:
             await update.effective_message.reply_text(build_tasks_report(text))
         return True
