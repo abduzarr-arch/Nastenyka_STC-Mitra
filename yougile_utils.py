@@ -345,6 +345,63 @@ def build_yougile_summary() -> str:
     return "\n".join(lines)
 
 
+def build_yougile_manager_summary(limit_projects: int = 8, limit_tasks: int = 10) -> str:
+    if not _is_configured():
+        return ""
+
+    projects = yougile_projects(limit=150)
+    boards = yougile_boards(limit=300)
+    columns = yougile_columns(limit=500)
+    tasks = yougile_tasks(limit=500)
+    if not tasks:
+        return "YouGile: подключен, но задачи не найдены."
+
+    project_names = {
+        _item_id(project): (_text_value(project, "title", "name") or "без проекта")
+        for project in projects
+        if _item_id(project)
+    }
+    board_to_project = {
+        _item_id(board): _board_project_id(board)
+        for board in boards
+        if _item_id(board)
+    }
+    column_to_board = {
+        _item_id(column): _column_board_id(column)
+        for column in columns
+        if _item_id(column)
+    }
+    column_names = _column_names(columns)
+
+    active = [task for task in tasks if not task.get("archived")]
+    with_deadline = [task for task in active if _task_deadline(task)]
+    by_project: Dict[str, int] = {}
+
+    for task in active:
+        column_id = _task_column_id(task)
+        board_id = column_to_board.get(column_id) or _nested_id(task, "board")
+        project_id = board_to_project.get(board_id) or _nested_id(task, "project")
+        project_name = project_names.get(project_id) or "без проекта"
+        by_project[project_name] = by_project.get(project_name, 0) + 1
+
+    lines = [
+        "YouGile",
+        f"Активных задач: {len(active)} · всего в выборке: {len(tasks)} · со сроками: {len(with_deadline)}",
+    ]
+
+    if by_project:
+        lines.append("По проектам:")
+        for project, count in sorted(by_project.items(), key=lambda item: item[1], reverse=True)[:limit_projects]:
+            lines.append(f"- {project}: {count}")
+
+    if active:
+        lines.append("Ближайшие задачи для контроля:")
+        for index, task in enumerate(active[:limit_tasks], start=1):
+            lines.append(f"{index}. {_format_task_line(task, column_names)}")
+
+    return "\n".join(lines)
+
+
 def _parse_create_args(text: str) -> tuple[str, str, str]:
     raw = (text or "").strip()
     if "|" in raw:

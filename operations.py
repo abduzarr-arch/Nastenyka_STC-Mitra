@@ -163,6 +163,17 @@ def _is_stale_task(task: dict, days: int = 2) -> bool:
     return status_days is not None and status_days >= days
 
 
+def _build_yougile_manager_block() -> str:
+    if os.getenv("YOUGILE_INCLUDE_IN_MANAGER_SUMMARY", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return ""
+    try:
+        from yougile_utils import build_yougile_manager_summary
+        return build_yougile_manager_summary()
+    except Exception as exc:
+        logger.exception("Failed to build YouGile manager summary: %s", exc)
+        return f"YouGile: не удалось получить данные: {exc}"
+
+
 def _extract_deadline_text(text: str) -> Optional[str]:
     patterns = [
         r"\bк\s+([0-3]?\d\s+числ[ауо]?)",
@@ -464,6 +475,7 @@ def build_manager_summary(limit: int = 40) -> str:
     for task in active:
         project = task.get("project_name") or "без объекта"
         by_project[project] = by_project.get(project, 0) + 1
+    yougile_block = _build_yougile_manager_block()
 
     lines = [
         "Сводка руководителя",
@@ -497,8 +509,13 @@ def build_manager_summary(limit: int = 40) -> str:
         for project, count in sorted(by_project.items(), key=lambda item: item[1], reverse=True)[:10]:
             lines.append(f"— {project}: {count}")
 
-    if not active:
+    if yougile_block:
+        lines.append("\n" + yougile_block)
+
+    if not active and not yougile_block:
         lines.append("\nАктивных задач нет. Можно ставить задачи обычным текстом: «Настя, по объекту ... нужно, чтобы ... сделал ... к пятнице»")
+    elif not active:
+        lines.append("\nВо внутреннем задачнике Настеньки активных задач нет; выше показаны данные из YouGile.")
     else:
         lines.append("\nБлижайшее действие: запросить статусы по блоку «нет свежего статуса» и отдельно разобрать высокий риск.")
 
@@ -965,10 +982,12 @@ async def schedule_operational_task_checker(app) -> None:
 
 async def send_daily_manager_summary(context) -> None:
     summary = build_manager_summary()
+    from internet_search import split_telegram_text
     bot = context.bot
     for admin_id in ADMIN_IDS:
         try:
-            await bot.send_message(chat_id=admin_id, text=summary)
+            for part in split_telegram_text(summary):
+                await bot.send_message(chat_id=admin_id, text=part)
         except Exception as exc:
             logger.exception("Failed to send daily manager summary to %s: %s", admin_id, exc)
 
@@ -1019,7 +1038,9 @@ async def check_due_operational_tasks(app) -> None:
 
 
 async def daily_summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(build_manager_summary())
+    from internet_search import split_telegram_text
+    for part in split_telegram_text(build_manager_summary()):
+        await update.effective_message.reply_text(part)
 
 
 def operational_bot_commands() -> List[BotCommand]:
