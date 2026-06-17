@@ -16,6 +16,10 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.text.paragraph import Paragraph
 from openai import OpenAI
+try:
+    from docxtpl import DocxTemplate
+except Exception:
+    DocxTemplate = None
 
 from config import DEEPSEEK_API_KEY, DEEPSEEK_MODEL, OPENAI_API_KEY, WORD_AI_PROVIDER, WORD_OPENAI_MODEL, logger
 from database import add_to_conversation
@@ -96,6 +100,116 @@ def _word_cache_dir() -> str:
             base = os.path.join(tempfile.gettempdir(), "mitra_word_cache")
     os.makedirs(base, exist_ok=True)
     return base
+
+
+def _word_template_dir() -> str:
+    explicit = os.getenv("WORD_TEMPLATE_DIR")
+    if explicit:
+        base = explicit
+    else:
+        db_file = os.getenv("DB_FILE")
+        if db_file:
+            base = os.path.join(os.path.dirname(os.path.abspath(db_file)), "word_templates")
+        elif os.getenv("RAILWAY_VOLUME_MOUNT_PATH"):
+            base = os.path.join(os.getenv("RAILWAY_VOLUME_MOUNT_PATH"), "word_templates")
+        else:
+            base = os.path.join(_word_cache_dir(), "templates")
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+def _list_word_templates() -> List[Dict[str, str]]:
+    template_dir = _word_template_dir()
+    templates = []
+    for path in sorted(Path(template_dir).glob("*.docx")):
+        if path.name.startswith("~$"):
+            continue
+        templates.append({"name": path.stem, "file_name": path.name, "path": str(path)})
+    return templates
+
+
+def _looks_like_template_upload(text: str) -> bool:
+    lowered = (text or "").lower()
+    return "шаблон" in lowered and any(word in lowered for word in ("word", "docx", "договор", "акт", "кп", "письмо", "коммерческ"))
+
+
+def _looks_like_template_list_request(text: str) -> bool:
+    lowered = (text or "").lower()
+    return "шаблон" in lowered and any(word in lowered for word in ("какие", "список", "покажи", "есть"))
+
+
+def remember_word_template(source_path: str, file_name: str, caption: str = "") -> Dict[str, str]:
+    safe_name = _safe_filename(file_name or "word_template.docx")
+    stem = Path(safe_name).stem
+    lowered = (caption or "").lower()
+    for marker in ("шаблон договора", "шаблон договор"):
+        if marker in lowered and "договор" not in stem.lower():
+            stem = "шаблон_договора"
+            break
+    if "шаблон кп" in lowered and "кп" not in stem.lower():
+        stem = "шаблон_кп"
+    if "шаблон акта" in lowered and "акт" not in stem.lower():
+        stem = "шаблон_акта"
+    if "шаблон письма" in lowered and "письм" not in stem.lower():
+        stem = "шаблон_письма"
+
+    target_name = _safe_filename(stem + ".docx")
+    target_path = os.path.join(_word_template_dir(), target_name)
+    shutil.copy2(source_path, target_path)
+    return {"name": Path(target_name).stem, "file_name": target_name, "path": target_path}
+
+
+def _word_template_variables(template_path: str) -> List[str]:
+    if not DocxTemplate:
+        raise WordProcessingError("Не установлена библиотека docxtpl. Добавьте docxtpl в requirements.txt и перезапустите Railway.")
+    tpl = DocxTemplate(template_path)
+    try:
+        variables = tpl.get_undeclared_template_variables()
+    except TypeError:
+        variables = tpl.get_undeclared_template_variables({})
+    return sorted(str(v) for v in variables)
+
+
+def _score_template_for_request(template: Dict[str, str], request_text: str) -> int:
+    low = (request_text or "").lower()
+    name = (template.get("name") or "").lower()
+    score = 0
+    aliases = {
+        "договор": ("договор", "контракт"),
+        "кп": ("кп", "коммерческ", "предложен"),
+        "акт": ("акт", "прием", "приём", "сдач"),
+        "письм": ("письм", "ответ", "заказчик", "клиент"),
+        "протокол": ("протокол", "совещан", "встреч"),
+    }
+    for token in re.split(r"[\s_\-.]+", name):
+        if token and token in low:
+            score += 4
+    for key, words in aliases.items():
+        if key in name and any(word in low for word in words):
+            score += 10
+    return score
+
+
+def _choose_word_template(request_text: str) -> Optional[Dict[str, str]]:
+    templates = _list_word_templates()
+    if not templates:
+        return None
+    scored = sorted(
+        ((template, _score_template_for_request(template, request_text)) for template in templates),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    if scored[0][1] <= 0 and len(templates) != 1:
+        return None
+    return scored[0][0]
+
+
+def _render_word_template(template_path: str, context: Dict[str, Any], output_path: str) -> None:
+    if not DocxTemplate:
+        raise WordProcessingError("Не установлена библиотека docxtpl. Добавьте docxtpl в requirements.txt и перезапустите Railway.")
+    tpl = DocxTemplate(template_path)
+    tpl.render(context)
+    tpl.save(output_path)
 
 
 def remember_word_file(context, chat_id: int, source_path: str, file_name: str, dialog_key: Optional[str] = None) -> Dict[str, Any]:
@@ -768,7 +882,85 @@ def _build_word_from_spec(spec: Dict[str, Any], output_path: str) -> None:
     doc.save(output_path)
 
 
+def _build_template_context_with_ai(template: Dict[str, str], variables: List[str], request_text: str) -> Dict[str, Any]:
+    system_prompt = """
+Ты заполняешь Word/DOCX-шаблон компании. Ответь ТОЛЬКО валидным JSON без markdown.
+Верни объект:
+{
+  "filename": "имя_файла.docx",
+  "message": "короткое описание результата",
+  "context": {"variable_name": "значение"}
+}
+Правила:
+- Заполни ВСЕ переменные шаблона из списка.
+- Если данных не хватает, ставь аккуратный заполнитель в квадратных скобках, например [указать сумму].
+- Для многострочных блоков используй переносы строк внутри строки.
+- Пиши на русском деловом языке.
+- Не меняй имена переменных.
+""".strip()
+    user_prompt = (
+        f"Шаблон: {template.get('file_name')}\n"
+        f"Переменные шаблона:\n{json.dumps(variables, ensure_ascii=False)}\n\n"
+        f"Запрос пользователя:\n{request_text}"
+    )
+    raw = _call_ai_for_word(system_prompt, user_prompt, max_tokens=4500, temperature=0.1)
+    spec = _extract_json(raw)
+    context = spec.get("context")
+    if not isinstance(context, dict):
+        raise WordProcessingError("ИИ не вернул context для Word-шаблона.")
+    for variable in variables:
+        context.setdefault(variable, f"[{variable}]")
+    return {
+        "filename": _safe_filename(spec.get("filename") or f"{Path(template.get('name') or 'document').stem}_filled.docx"),
+        "message": spec.get("message") or f"Готово, заполнила шаблон {template.get('file_name')}.",
+        "context": context,
+    }
+
+
+def create_word_from_template_request(request_text: str) -> Optional[Tuple[str, str]]:
+    template = _choose_word_template(request_text)
+    if not template:
+        return None
+
+    variables = _word_template_variables(template["path"])
+    if not variables:
+        return None
+
+    spec = _build_template_context_with_ai(template, variables, request_text)
+    output_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex[:6]}_{spec['filename']}")
+    _render_word_template(template["path"], spec["context"], output_path)
+    message = (
+        f"{spec['message']}\n"
+        f"Использован шаблон: {template.get('file_name')}\n"
+        f"Заполнено полей: {len(variables)}"
+    )
+    return output_path, message
+
+
+def format_word_templates_list() -> str:
+    templates = _list_word_templates()
+    if not templates:
+        return (
+            "Пока нет сохраненных Word-шаблонов.\n"
+            "Отправьте .docx с подписью: «это шаблон договора» или «это шаблон КП».\n"
+            "Внутри шаблона используйте переменные вида {{ client_name }}, {{ contract_subject }}, {{ price }}."
+        )
+    lines = ["Сохраненные Word-шаблоны:"]
+    for idx, template in enumerate(templates, start=1):
+        try:
+            variables = _word_template_variables(template["path"])
+            suffix = f" · полей: {len(variables)}" if variables else " · без переменных"
+        except Exception:
+            suffix = ""
+        lines.append(f"{idx}. {template['file_name']}{suffix}")
+    return "\n".join(lines)
+
+
 def create_word_from_request(request_text: str) -> Tuple[str, str]:
+    templated = create_word_from_template_request(request_text)
+    if templated:
+        return templated
+
     system_prompt = """
 Ты создаешь структуру Word/DOCX-документа по просьбе пользователя. Отвечай ТОЛЬКО валидным JSON без markdown.
 Верни объект:
@@ -814,6 +1006,20 @@ async def handle_word_document(update, context) -> None:
         with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
             tmp_path = tmp.name
         await file.download_to_drive(tmp_path)
+
+        if _looks_like_template_upload(user_request):
+            template = remember_word_template(tmp_path, file_name, user_request)
+            try:
+                variables = _word_template_variables(template["path"])
+            except Exception as exc:
+                variables = []
+                logger.warning("Saved Word template but could not inspect variables: %s", exc)
+            await update.message.reply_text(
+                f"Сохранила Word-шаблон: {template['file_name']}\n"
+                f"Найдено полей для заполнения: {len(variables)}\n\n"
+                "Теперь можно просить: «Создай договор в Word по шаблону...» или «Сформируй КП в Word...»."
+            )
+            return
 
         user_id = get_dialog_key(update)
         remember_word_file(context, update.effective_chat.id, tmp_path, file_name, user_id)
@@ -931,6 +1137,10 @@ async def handle_word_followup_text(update, context, text: str) -> bool:
 
 
 async def handle_create_word_text(update, context, text: str) -> bool:
+    if _looks_like_template_list_request(text):
+        await update.message.reply_text(format_word_templates_list())
+        return True
+
     if not is_create_word_request(text):
         return False
 
