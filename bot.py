@@ -62,7 +62,7 @@ from assignments import (
     schedule_controlled_tasks_checker,
     stop_followup_command,
 )
-from internet_search import answer_online, search_command, should_use_online_search, split_telegram_text
+from internet_search import answer_online, is_online_search_failure, search_command, should_use_online_search, split_telegram_text
 from operations import (
     build_team_context,
     daily_summary_command,
@@ -405,6 +405,9 @@ async def process_text_request(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if should_use_online_search(user_message):
         response = await asyncio.to_thread(answer_online, user_message, dialog_key)
+        if is_online_search_failure(response):
+            logger.warning("Online search failed; falling back to regular AI response")
+            response = await asyncio.to_thread(ask_deepseek, prompt, dialog_key)
     else:
         response = await asyncio.to_thread(ask_deepseek, prompt, dialog_key)
     for part in split_telegram_text(response):

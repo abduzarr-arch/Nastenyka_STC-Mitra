@@ -72,6 +72,29 @@ SOFT_CURRENT_MARKERS = [
     "2026",
 ]
 
+NON_SEARCH_WORK_MARKERS = [
+    "сформировать промпт",
+    "составить промпт",
+    "напиши промпт",
+    "промпт для",
+    "ии-агент",
+    "ии агент",
+    "агента",
+    "для агента",
+    "сформировать раздел",
+    "составить раздел",
+    "подготовить раздел",
+    "техническое задание",
+    "тз для",
+]
+
+ONLINE_SEARCH_FAILURE_MARKERS = [
+    "Не удалось выполнить онлайн-поиск",
+    "Онлайн-поиск пока не настроен",
+    "Не настроен OPENAI_API_KEY для онлайн-поиска",
+    "TAVILY_API_KEY задан, но",
+]
+
 
 def _bool(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "да", "on"}
@@ -88,9 +111,16 @@ def should_use_online_search(text: str) -> bool:
     if any(re.search(pattern, low) for pattern in EXPLICIT_SEARCH_PATTERNS):
         return True
 
+    if any(marker in low for marker in NON_SEARCH_WORK_MARKERS):
+        return False
+
     # Не включаем интернет на каждую бытовую фразу, только если есть явный намек
     # на свежие или проверяемые данные.
     return any(marker in low for marker in SOFT_CURRENT_MARKERS)
+
+
+def is_online_search_failure(answer: str) -> bool:
+    return any(marker in (answer or "") for marker in ONLINE_SEARCH_FAILURE_MARKERS)
 
 
 def _clean_query(text: str) -> str:

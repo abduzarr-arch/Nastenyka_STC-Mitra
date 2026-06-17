@@ -24,7 +24,7 @@ from excel_utils import handle_excel_document, is_excel_file
 from docx_utils import handle_word_document, is_word_file
 from cross_chat import remember_current_group_chat, remember_visible_chat_participants
 from group_utils import clean_group_trigger_text, get_dialog_key, is_addressed_to_bot, is_group_chat
-from internet_search import answer_online, should_use_online_search
+from internet_search import answer_online, is_online_search_failure, should_use_online_search
 
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
@@ -125,6 +125,9 @@ async def handle_voice_message(update, context):
 
         if should_use_online_search(recognized_text):
             answer = await to_thread(answer_online, recognized_text, get_dialog_key(update))
+            if is_online_search_failure(answer):
+                logger.warning("Online search failed for voice request; falling back to regular AI response")
+                answer = await to_thread(ask_deepseek, recognized_text, get_dialog_key(update))
         else:
             answer = await to_thread(ask_deepseek, recognized_text, get_dialog_key(update))
         await update.message.reply_text(answer)
