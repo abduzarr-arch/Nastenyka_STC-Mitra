@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -6,6 +7,8 @@ import shutil
 import tempfile
 import time as time_module
 import uuid
+import zipfile
+from collections import Counter
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -14,6 +17,10 @@ import requests
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.oxml.table import CT_Tbl
+from docx.oxml.text.paragraph import CT_P
+from docx.table import Table
 from docx.text.paragraph import Paragraph
 from openai import OpenAI
 try:
@@ -84,6 +91,11 @@ def _safe_filename(name: str, default: str = "document_result.docx") -> str:
     if not name.lower().endswith(".docx"):
         name += ".docx"
     return name[:120]
+
+
+def _delivery_filename(path: str) -> str:
+    name = os.path.basename(path or "document_result.docx")
+    return _safe_filename(re.sub(r"^[0-9a-f]{6}_", "", name, flags=re.IGNORECASE))
 
 
 def _word_cache_dir() -> str:
@@ -339,41 +351,167 @@ def _is_word_followup_request(context, text: str, dialog_key: str) -> bool:
     return any(word in lowered for word in ("word", "docx", "ворд", "договор", "пункт", "раздел", "оплат", "расчет"))
 
 
-def _trim_text(text: str, limit: int = 55000) -> str:
+def _trim_text(text: str, limit: int = 90000) -> str:
     if len(text) <= limit:
         return text
     return _clip_text_at_boundary(text, limit, "\n... [текст документа обрезан из-за размера файла]")
 
 
-def document_to_text(path: str, max_paragraphs: int = 260, max_tables: int = 15, max_table_rows: int = 40, max_cell_chars: int = 1200) -> str:
-    """Текстовое представление DOCX: абзацы + таблицы."""
-    doc = Document(path)
-    parts: List[str] = []
+def _length_cm(value) -> str:
+    if value is None:
+        return "auto"
+    try:
+        return f"{value.cm:.2f}"
+    except Exception:
+        return str(value)
 
-    paragraph_count = 0
-    for idx, paragraph in enumerate(doc.paragraphs, start=1):
-        text = (paragraph.text or "").strip()
-        if not text:
-            continue
-        paragraph_count += 1
-        if paragraph_count > max_paragraphs:
-            parts.append(f"... показаны первые {max_paragraphs} непустых абзацев")
-            break
-        style = paragraph.style.name if paragraph.style is not None else ""
-        parts.append(f"[P{idx}; style={style}] {text}")
 
-    for t_idx, table in enumerate(doc.tables[:max_tables], start=1):
-        parts.append(f"\n=== Таблица {t_idx}: {len(table.rows)} строк x {len(table.columns)} столбцов ===")
-        for r_idx, row in enumerate(table.rows[:max_table_rows], start=1):
-            values = []
+def _document_style_profile(doc: Document) -> str:
+    styles = Counter()
+    fonts = Counter()
+    for paragraph in doc.paragraphs:
+        style_name = paragraph.style.name if paragraph.style is not None else "без стиля"
+        if (paragraph.text or "").strip():
+            styles[style_name] += 1
+        for run in paragraph.runs:
+            if run.text and run.font.name:
+                fonts[run.font.name] += len(run.text)
+    for table in doc.tables:
+        for row in table.rows:
             for cell in row.cells:
-                cell_text = " ".join((p.text or "").strip() for p in cell.paragraphs if (p.text or "").strip())
-                values.append(_clip_text_at_boundary(cell_text, max_cell_chars, " ... [ячейка обрезана из-за лимита]"))
-            parts.append(" | ".join(values))
-        if len(table.rows) > max_table_rows:
-            parts.append(f"... показаны первые {max_table_rows} строк таблицы")
+                for paragraph in cell.paragraphs:
+                    style_name = paragraph.style.name if paragraph.style is not None else "без стиля"
+                    if (paragraph.text or "").strip():
+                        styles[style_name] += 1
+                    for run in paragraph.runs:
+                        if run.text and run.font.name:
+                            fonts[run.font.name] += len(run.text)
 
-    if not parts:
+    style_text = ", ".join(f"{name}: {count}" for name, count in styles.most_common(8)) or "нет данных"
+    font_text = ", ".join(name for name, _ in fonts.most_common(5)) or "задаются стилями документа"
+    section_lines = []
+    for idx, section in enumerate(doc.sections, start=1):
+        section_lines.append(
+            f"S{idx}: page={_length_cm(section.page_width)}x{_length_cm(section.page_height)} cm; "
+            f"margins={_length_cm(section.top_margin)}/{_length_cm(section.right_margin)}/"
+            f"{_length_cm(section.bottom_margin)}/{_length_cm(section.left_margin)} cm; "
+            f"header={_length_cm(section.header_distance)} cm; footer={_length_cm(section.footer_distance)} cm"
+        )
+    return (
+        "[DOCUMENT PROFILE]\n"
+        f"Sections: {len(doc.sections)}; body paragraphs: {len(doc.paragraphs)}; tables: {len(doc.tables)}\n"
+        f"Common paragraph styles: {style_text}\n"
+        f"Explicit fonts: {font_text}\n"
+        + "\n".join(section_lines)
+    )
+
+
+def _iter_body_blocks(doc: Document):
+    for child in doc.element.body.iterchildren():
+        if isinstance(child, CT_P):
+            yield Paragraph(child, doc)
+        elif isinstance(child, CT_Tbl):
+            yield Table(child, doc)
+
+
+def _paragraph_format_hint(paragraph: Paragraph) -> str:
+    values = []
+    if paragraph.alignment is not None:
+        values.append(f"align={paragraph.alignment}")
+    fmt = paragraph.paragraph_format
+    for label, value in (
+        ("left", fmt.left_indent),
+        ("right", fmt.right_indent),
+        ("first", fmt.first_line_indent),
+        ("before", fmt.space_before),
+        ("after", fmt.space_after),
+    ):
+        if value is not None:
+            values.append(f"{label}={_length_cm(value)}cm")
+    if fmt.line_spacing is not None:
+        values.append(f"line={fmt.line_spacing}")
+    try:
+        if paragraph._p.pPr is not None and paragraph._p.pPr.numPr is not None:
+            values.append("numbered=yes")
+    except Exception:
+        pass
+    ref_run = next((run for run in paragraph.runs if run.text), None)
+    if ref_run is not None:
+        if ref_run.font.name:
+            values.append(f"font={ref_run.font.name}")
+        if ref_run.font.size:
+            values.append(f"size={ref_run.font.size.pt:g}pt")
+        if ref_run.bold:
+            values.append("bold=yes")
+        if ref_run.italic:
+            values.append("italic=yes")
+    return ";".join(values) or "inherited"
+
+
+def document_to_text(path: str, max_paragraphs: int = 500, max_tables: int = 30, max_table_rows: int = 150, max_cell_chars: int = 1400) -> str:
+    """Structured DOCX view in original block order with stable target IDs."""
+    doc = Document(path)
+    parts: List[str] = [_document_style_profile(doc), "\n[DOCUMENT CONTENT]"]
+    paragraph_count = 0
+    table_count = 0
+    truncated_paragraphs = False
+    for block in _iter_body_blocks(doc):
+        if isinstance(block, Paragraph):
+            paragraph_count += 1
+            if paragraph_count > max_paragraphs:
+                truncated_paragraphs = True
+                continue
+            text = (block.text or "").strip()
+            if text:
+                style = block.style.name if block.style is not None else ""
+                parts.append(
+                    f"[P{paragraph_count}; style={style}; fmt={_paragraph_format_hint(block)}] {text}"
+                )
+            continue
+
+        table_count += 1
+        if table_count > max_tables:
+            continue
+        table = block
+        style = table.style.name if table.style is not None else ""
+        parts.append(
+            f"\n[T{table_count}; style={style}; rows={len(table.rows)}; cols={len(table.columns)}]"
+        )
+        seen_cells: Dict[Any, str] = {}
+        for r_idx, row in enumerate(table.rows[:max_table_rows], start=1):
+            for c_idx, cell in enumerate(row.cells, start=1):
+                cell_key = cell._tc
+                cell_id = f"T{table_count}.R{r_idx}.C{c_idx}"
+                if cell_key in seen_cells:
+                    parts.append(f"[{cell_id}; merged-with={seen_cells[cell_key]}]")
+                    continue
+                seen_cells[cell_key] = cell_id
+                nonempty = False
+                for p_idx, paragraph in enumerate(cell.paragraphs, start=1):
+                    text = (paragraph.text or "").strip()
+                    if not text:
+                        continue
+                    nonempty = True
+                    style_name = paragraph.style.name if paragraph.style is not None else ""
+                    clipped = _clip_text_at_boundary(
+                        text,
+                        max_cell_chars,
+                        " ... [текст ячейки сокращен из-за лимита]",
+                    )
+                    parts.append(
+                        f"[{cell_id}.P{p_idx}; style={style_name}; "
+                        f"fmt={_paragraph_format_hint(paragraph)}] {clipped}"
+                    )
+                if not nonempty:
+                    parts.append(f"[{cell_id}.P1; empty]")
+        if len(table.rows) > max_table_rows:
+            parts.append(f"[T{table_count}] показаны первые {max_table_rows} строк")
+
+    if truncated_paragraphs:
+        parts.append(f"[BODY] показаны первые {max_paragraphs} абзацев")
+    if len(doc.tables) > max_tables:
+        parts.append(f"[TABLES] показаны первые {max_tables} таблиц из {len(doc.tables)}")
+    if len(parts) <= 2:
         parts.append("[Документ не содержит извлекаемого текста или состоит из изображений/сканов]")
     return _trim_text("\n".join(parts))
 
@@ -430,7 +568,7 @@ def _call_openai_for_word(system_prompt: str, user_prompt: str, max_tokens: int 
         word_token_limit = 8000
 
     try:
-        response = openai_word_client.chat.completions.create(
+        request_args = dict(
             model=WORD_OPENAI_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -439,6 +577,22 @@ def _call_openai_for_word(system_prompt: str, user_prompt: str, max_tokens: int 
             max_tokens=max(512, min(word_token_limit, max_tokens)),
             temperature=temperature,
         )
+        wants_json = "json" in system_prompt.lower() and (
+            "валидн" in system_prompt.lower() or "only" in system_prompt.lower()
+        )
+        if wants_json:
+            request_args["response_format"] = {"type": "json_object"}
+        try:
+            response = openai_word_client.chat.completions.create(**request_args)
+        except Exception as response_format_error:
+            error_text = str(response_format_error).lower()
+            if not wants_json or not any(
+                marker in error_text
+                for marker in ("response_format", "json_object", "unsupported", "not supported")
+            ):
+                raise
+            request_args.pop("response_format", None)
+            response = openai_word_client.chat.completions.create(**request_args)
         choice = response.choices[0]
         content = choice.message.content or ""
         finish_reason = choice.finish_reason or "unknown"
@@ -486,7 +640,9 @@ def analyze_word_with_ai(path: str, file_name: str, question: str, user_id: str,
     system_prompt = (
         "Ты — ассистент, который анализирует Word/DOCX документы. Отвечай на русском. "
         "Используй текст Word-документа и дополнительные документы-основания, если они переданы. "
-        "Если часть документа не видна или это скан, честно скажи об этом."
+        "Если часть документа не видна или это скан, честно скажи об этом. "
+        "Служебные пометки «текст сокращен из-за лимита» означают только ограничение переданного контекста; "
+        "они не доказывают повреждение исходного DOCX и не являются обрывом текста в самом файле."
     )
     user_prompt = (
         f"Файл: {file_name}\n\n"
@@ -501,7 +657,13 @@ def analyze_word_with_ai(path: str, file_name: str, question: str, user_id: str,
 
 
 def build_word_patch_with_ai(path: str, file_name: str, request_text: str, reference_context: str = "") -> Dict[str, Any]:
-    document_text = document_to_text(path, max_paragraphs=220, max_tables=12, max_table_rows=35, max_cell_chars=900)
+    document_text = document_to_text(
+        path,
+        max_paragraphs=500,
+        max_tables=30,
+        max_table_rows=150,
+        max_cell_chars=1400,
+    )
     reference_context = _clip_text_at_boundary(
         reference_context or "",
         14000,
@@ -513,16 +675,27 @@ def build_word_patch_with_ai(path: str, file_name: str, request_text: str, refer
 Не выдумывай реквизиты, суммы, даты и юридические условия, которых пользователь не дал. Если точных данных нет, используй понятные заполнители в квадратных скобках: [сумма], [процент], [дата], [этап].
 
 Доступные действия:
-1) append_section: добавить раздел в конец документа.
+1) replace_text: заменить точный фрагмент внутри адресного абзаца или ячейки, сохраняя оформление остальных фрагментов.
+   {"type":"replace_text","target_id":"P12","old_text":"старый срок","new_text":"новый срок"}
+   Для таблицы target_id имеет вид T2.R4.C3.P1.
+2) replace_block: заменить весь адресный абзац/абзац ячейки и при необходимости вставить после него дополнительные абзацы.
+   {"type":"replace_block","target_id":"T1.R5.C2.P1","paragraphs":["Новая редакция текста"]}
+3) insert_after: вставить абзацы после точного адресного абзаца.
+   {"type":"insert_after","target_id":"P18","paragraphs":["Новый пункт 1","Новый пункт 2"]}
+4) insert_table_rows: добавить строки в существующую таблицу, копируя оформление соседней строки.
+   {"type":"insert_table_rows","table_id":"T2","after_row":4,"rows":[["5","Новая работа","10 дней"]]}
+5) append_section: добавить раздел в конец документа.
    {"type":"append_section","heading":"Этапность оплат","paragraphs":["1. ...","2. ..."]}
-2) insert_after_heading: вставить новый раздел после существующего заголовка/абзаца, который содержит фразу.
+6) insert_after_heading: резервный вариант для вставки после заголовка/абзаца, который содержит фразу.
    {"type":"insert_after_heading","heading_contains":"оплат","new_heading":"Этапность оплат","paragraphs":["..."]}
-3) replace_paragraph_contains: заменить первый абзац, содержащий фразу, на один или несколько новых абзацев.
+7) replace_paragraph_contains: резервный вариант, если точного target_id нет.
    {"type":"replace_paragraph_contains","contains":"старый текст или ключевая фраза","paragraphs":["новая редакция..."]}
-4) append_paragraphs: добавить абзацы в конец документа без заголовка.
+8) append_paragraphs: добавить абзацы в конец документа без заголовка.
    {"type":"append_paragraphs","paragraphs":["..."]}
-5) add_table: добавить таблицу в конец документа.
-   {"type":"add_table","heading":"График оплат","headers":["Этап","Срок","Размер оплаты"],"rows":[["1","[дата]","[процент]"]]}
+9) add_table: добавить таблицу после адресного абзаца или в конец документа.
+   {"type":"add_table","after_target_id":"P25","heading":"График оплат","headers":["Этап","Срок","Размер оплаты"],"rows":[["1","[дата]","[процент]"]]}
+10) format_like: привести оформление адресного абзаца к оформлению другого существующего абзаца.
+   {"type":"format_like","target_id":"P26","reference_id":"P25"}
 
 Верни объект:
 {
@@ -533,11 +706,18 @@ def build_word_patch_with_ai(path: str, file_name: str, request_text: str, refer
 }
 
 Правила:
+- Строки вида [P12], [T2.R4.C3.P1] — точные адреса элементов. Для изменения существующего текста всегда предпочитай target_id.
+- Служебные пометки о сокращении текста означают лимит контекста, а не повреждение или обрыв исходного DOCX.
+- Документ уже содержит корпоративные стили. Не задавай шрифты, размеры, поля и отступы в JSON: редактор скопирует их из соседнего исходного элемента.
+- Для таблиц меняй текст конкретной ячейки через replace_text/replace_block. Не пересоздавай всю таблицу ради нескольких изменений.
+- Не заменяй целый абзац, если достаточно заменить короткий фрагмент через replace_text.
+- format_like используй только если пользователь явно просит исправить оформление; reference_id должен указывать на правильно оформленный соседний образец.
 - Если пользователь просит просто проанализировать документ, верни actions: [] и message с кратким пояснением.
 - Если пользователь просит добавить этапность оплат, найди раздел про оплату/расчеты. Если такого раздела не видно — добавь новый раздел в конец: «Этапность оплат».
 - Если пользователь просит изменить договор по ТЗ/КП/PDF и такие дополнительные документы переданы ниже, используй их как основание для правок. Не проси прислать ТЗ/КП повторно, если в блоке дополнительных документов уже есть релевантный текст.
 - Для договора сохраняй деловой юридический стиль, но не утверждай, что это финальная юридическая редакция.
 - Не удаляй большие фрагменты, если пользователь явно не просит.
+- Не добавляй предложенные правки отдельным разделом в конец, если в документе видны точные места для замены.
 - Не используй макросы, внешние ссылки и произвольный код.
 """.strip()
     def make_user_prompt(ref_context: str) -> str:
@@ -568,47 +748,52 @@ def build_word_patch_with_ai(path: str, file_name: str, request_text: str, refer
   "message": "что будет изменено",
   "output_filename": "edited.docx",
   "actions": [
-    {"type":"replace_paragraph_contains","contains":"фраза из договора","paragraphs":["новый текст"]},
+    {"type":"replace_text","target_id":"P12","old_text":"точный старый текст","new_text":"новый текст"},
+    {"type":"replace_block","target_id":"T1.R3.C2.P1","paragraphs":["новый текст ячейки"]},
     {"type":"append_section","heading":"Название раздела","paragraphs":["текст"]}
   ]
 }
-Используй ТЗ/КП как основание. Если точное место замены не найдено, добавь новый раздел append_section.
+Используй ТЗ/КП как основание. target_id бери из структуры DOCX.
+Не добавляй общий раздел в конец вместо адресных правок существующего текста.
 Не проси ТЗ/КП повторно, если они есть в контексте. Не выдумывай неизвестные суммы и реквизиты.
 """.strip()
             simple_request = (
                 "Сделай минимальный JSON-план правок договора по ТЗ/КП.\n\n"
-                f"DOCX:\n{_clip_text_at_boundary(document_text, 12000)}\n\n"
-                f"ТЗ/КП:\n{_clip_text_at_boundary(reduced_context, 5000)}\n\n"
+                f"DOCX:\n{_clip_text_at_boundary(document_text, 45000)}\n\n"
+                f"ТЗ/КП:\n{_clip_text_at_boundary(reduced_context, 9000)}\n\n"
                 f"Просьба:\n{request_text}\n\n"
                 f"Первичная ошибка модели: {first_error}"
             )
             raw = _call_ai_for_word(simple_system_prompt, simple_request, max_tokens=5000, temperature=0.1)
     try:
         patch = _extract_json(raw)
-    except WordProcessingError:
-        fallback_text = _call_ai_for_word(
-            "Ты помощник по договорам. На русском языке кратко перечисли конкретные правки договора по ТЗ/КП. Без markdown-таблиц.",
+    except WordProcessingError as json_error:
+        repair_raw = _call_ai_for_word(
+            """
+Исправь план редактирования DOCX и верни ТОЛЬКО завершенный валидный JSON без markdown.
+Формат: {"need_clarification":false,"message":"...","output_filename":"edited.docx","actions":[]}.
+Для точечных правок используй replace_text с target_id, old_text и new_text либо replace_block с target_id и paragraphs.
+target_id бери только из структуры документа: P12 или T2.R4.C3.P1.
+Не добавляй общий раздел с предложениями в конец вместо реальных правок.
+Если надежный адрес правки определить нельзя, верни need_clarification=true, actions=[] и объясни, что уточнить.
+""".strip(),
             (
-                f"Договор:\n{_clip_text_at_boundary(document_text, 12000)}\n\n"
-                f"ТЗ/КП:\n{_clip_text_at_boundary(reference_context, 7000)}\n\n"
+                f"Структура DOCX:\n{_clip_text_at_boundary(document_text, 50000)}\n\n"
+                f"ТЗ/КП:\n{_clip_text_at_boundary(reference_context, 10000)}\n\n"
                 f"Просьба:\n{request_text}\n\n"
-                "Дай готовый раздел с предлагаемыми изменениями для вставки в конец договора."
+                f"Незавершенный/ошибочный ответ:\n{_clip_text_at_boundary(raw, 9000)}\n\n"
+                f"Ошибка JSON: {json_error}"
             ),
-            max_tokens=2500,
-            temperature=0.2,
+            max_tokens=7000,
+            temperature=0.0,
         )
-        patch = {
-            "need_clarification": False,
-            "message": "Не удалось надежно собрать точечный JSON-план замен, поэтому добавляю в договор раздел с предлагаемыми правками по ТЗ/КП.",
-            "output_filename": f"{Path(file_name).stem}_edited.docx",
-            "actions": [
-                {
-                    "type": "append_section",
-                    "heading": "Предлагаемые правки по ТЗ и КП",
-                    "paragraphs": [p.strip() for p in fallback_text.splitlines() if p.strip()][:25],
-                }
-            ],
-        }
+        try:
+            patch = _extract_json(repair_raw)
+        except WordProcessingError as repair_error:
+            raise WordProcessingError(
+                "ИИ не смог сформировать надежный адресный план правок. "
+                "Попробуйте указать конкретный раздел, пункт или фразу для изменения."
+            ) from repair_error
     if not isinstance(patch, dict):
         raise WordProcessingError("ИИ вернул не объект JSON")
     patch.setdefault("need_clarification", False)
@@ -653,7 +838,77 @@ def _copy_run_format(source: Optional[Paragraph], target_run) -> None:
         pass
 
 
-def _set_paragraph_text_like(paragraph: Paragraph, text: str, reference: Optional[Paragraph] = None) -> None:
+def _paragraph_text_nodes(paragraph: Paragraph):
+    return list(paragraph._p.iter(qn("w:t")))
+
+
+def _set_text_node(node, value: str) -> None:
+    node.text = value
+    xml_space = "{http://www.w3.org/XML/1998/namespace}space"
+    if value[:1].isspace() or value[-1:].isspace():
+        node.set(xml_space, "preserve")
+    elif node.get(xml_space) is not None:
+        del node.attrib[xml_space]
+
+
+def _replace_text_preserving_xml(paragraph: Paragraph, old_text: str, new_text: str) -> bool:
+    nodes = _paragraph_text_nodes(paragraph)
+    values = [node.text or "" for node in nodes]
+    full_text = "".join(values)
+    old_text = str(old_text or "")
+    if not nodes or not old_text:
+        return False
+
+    start = full_text.find(old_text)
+    if start < 0:
+        start = full_text.lower().find(old_text.lower())
+    if start < 0:
+        return False
+    end = start + len(old_text)
+
+    offsets = []
+    cursor = 0
+    for value in values:
+        offsets.append((cursor, cursor + len(value)))
+        cursor += len(value)
+    affected = [
+        idx
+        for idx, (node_start, node_end) in enumerate(offsets)
+        if node_end > start and node_start < end
+    ]
+    if not affected:
+        return False
+
+    first_idx = affected[0]
+    last_idx = affected[-1]
+    first_start, _ = offsets[first_idx]
+    _, last_end = offsets[last_idx]
+    prefix = values[first_idx][:max(0, start - first_start)]
+    suffix_start = max(0, len(values[last_idx]) - (last_end - end))
+    suffix = values[last_idx][suffix_start:]
+
+    if first_idx == last_idx:
+        _set_text_node(nodes[first_idx], prefix + str(new_text) + suffix)
+        return True
+
+    _set_text_node(nodes[first_idx], prefix + str(new_text))
+    for idx in affected[1:-1]:
+        _set_text_node(nodes[idx], "")
+    _set_text_node(nodes[last_idx], suffix)
+    return True
+
+
+def _replace_whole_paragraph_text(paragraph: Paragraph, text: str) -> None:
+    nodes = _paragraph_text_nodes(paragraph)
+    current = "".join(node.text or "" for node in nodes)
+    if nodes and current:
+        if _replace_text_preserving_xml(paragraph, current, text):
+            return
+    _set_paragraph_text_like_runs(paragraph, text, paragraph)
+
+
+def _set_paragraph_text_like_runs(paragraph: Paragraph, text: str, reference: Optional[Paragraph] = None) -> None:
+    """Fallback for a new/empty paragraph that has no reusable XML text nodes."""
     saved_rpr = None
     if reference is not None:
         ref_run = next((run for run in reference.runs if run.text), None)
@@ -676,6 +931,14 @@ def _set_paragraph_text_like(paragraph: Paragraph, text: str, reference: Optiona
             run._r.insert(0, saved_rpr)
         else:
             _copy_run_format(reference, run)
+
+
+def _set_paragraph_text_like(paragraph: Paragraph, text: str, reference: Optional[Paragraph] = None) -> None:
+    nodes = _paragraph_text_nodes(paragraph)
+    current = "".join(node.text or "" for node in nodes)
+    if current and _replace_text_preserving_xml(paragraph, current, text):
+        return
+    _set_paragraph_text_like_runs(paragraph, text, reference)
 
 
 def _last_text_paragraph(doc: Document) -> Optional[Paragraph]:
@@ -714,8 +977,39 @@ def _insert_paragraph_after(paragraph: Paragraph, text: str = "", style: Optiona
 
 
 def _clear_and_set_paragraph(paragraph: Paragraph, text: str) -> None:
-    # Сохраняем стиль абзаца, но очищаем старые run'ы.
-    _set_paragraph_text_like(paragraph, text, paragraph)
+    _replace_whole_paragraph_text(paragraph, text)
+
+
+def _build_word_targets(doc: Document) -> Tuple[Dict[str, Paragraph], Dict[str, Table]]:
+    paragraphs: Dict[str, Paragraph] = {}
+    tables: Dict[str, Table] = {}
+    paragraph_count = 0
+    table_count = 0
+    for block in _iter_body_blocks(doc):
+        if isinstance(block, Paragraph):
+            paragraph_count += 1
+            paragraphs[f"P{paragraph_count}"] = block
+            continue
+        table_count += 1
+        table_id = f"T{table_count}"
+        tables[table_id] = block
+        for r_idx, row in enumerate(block.rows, start=1):
+            for c_idx, cell in enumerate(row.cells, start=1):
+                for p_idx, paragraph in enumerate(cell.paragraphs, start=1):
+                    paragraphs[f"{table_id}.R{r_idx}.C{c_idx}.P{p_idx}"] = paragraph
+    return paragraphs, tables
+
+
+def _find_heading_reference(doc: Document, level: int = 2) -> Optional[Paragraph]:
+    fallback = None
+    for paragraph in doc.paragraphs:
+        style_name = (paragraph.style.name if paragraph.style is not None else "").lower()
+        if "heading" not in style_name and "заголов" not in style_name:
+            continue
+        fallback = fallback or paragraph
+        if str(level) in style_name:
+            return paragraph
+    return fallback
 
 
 def _find_paragraph_containing(doc: Document, needle: str) -> Optional[Paragraph]:
@@ -739,17 +1033,23 @@ def _find_paragraph_containing(doc: Document, needle: str) -> Optional[Paragraph
 
 
 def _add_heading(doc: Document, heading: str, level: int = 2, after: Optional[Paragraph] = None) -> Paragraph:
+    heading_reference = _find_heading_reference(doc, level)
     if after is not None:
         new_p = OxmlElement("w:p")
         after._p.addnext(new_p)
         paragraph = Paragraph(new_p, after._parent)
+        _copy_paragraph_format(heading_reference or after, paragraph)
+        _set_paragraph_text_like_runs(paragraph, heading, heading_reference or after)
+        return paragraph
+    paragraph = doc.add_paragraph()
+    _copy_paragraph_format(heading_reference, paragraph)
+    if heading_reference is None:
         try:
             paragraph.style = f"Heading {level}"
         except Exception:
             pass
-        paragraph.add_run(heading)
-        return paragraph
-    return doc.add_heading(heading, level=level)
+    _set_paragraph_text_like_runs(paragraph, heading, heading_reference)
+    return paragraph
 
 
 def _add_paragraphs(doc: Document, paragraphs: List[str], after: Optional[Paragraph] = None, format_source: Optional[Paragraph] = None) -> Optional[Paragraph]:
@@ -773,6 +1073,48 @@ def _add_paragraphs(doc: Document, paragraphs: List[str], after: Optional[Paragr
     return last
 
 
+def _copy_cell_format(source_cell, target_cell) -> None:
+    try:
+        existing = target_cell._tc.tcPr
+        if existing is not None:
+            target_cell._tc.remove(existing)
+        if source_cell._tc.tcPr is not None:
+            target_cell._tc.insert(0, deepcopy(source_cell._tc.tcPr))
+    except Exception:
+        pass
+
+
+def _set_cell_text_like(target_cell, text: str, source_cell=None) -> None:
+    target_paragraph = target_cell.paragraphs[0]
+    source_paragraph = source_cell.paragraphs[0] if source_cell is not None and source_cell.paragraphs else None
+    _copy_paragraph_format(source_paragraph, target_paragraph)
+    _set_paragraph_text_like(target_paragraph, str(text or ""), source_paragraph)
+
+
+def _copy_table_format(source: Optional[Table], target: Table) -> None:
+    if source is None:
+        return
+    try:
+        existing = target._tbl.tblPr
+        if existing is not None:
+            target._tbl.remove(existing)
+        if source._tbl.tblPr is not None:
+            target._tbl.insert(0, deepcopy(source._tbl.tblPr))
+    except Exception:
+        pass
+    if len(source.columns) != len(target.columns):
+        return
+    try:
+        existing_grid = target._tbl.tblGrid
+        if existing_grid is not None:
+            target._tbl.remove(existing_grid)
+        if source._tbl.tblGrid is not None:
+            insert_at = 1 if target._tbl.tblPr is not None else 0
+            target._tbl.insert(insert_at, deepcopy(source._tbl.tblGrid))
+    except Exception:
+        pass
+
+
 def _add_table(doc: Document, heading: Optional[str], headers: List[str], rows: List[List[Any]], after: Optional[Paragraph] = None) -> None:
     if heading:
         after = _add_heading(doc, str(heading), level=2, after=after)
@@ -782,30 +1124,140 @@ def _add_table(doc: Document, heading: Optional[str], headers: List[str], rows: 
         headers = [f"Колонка {i+1}" for i in range(max(len(r) for r in rows))]
     if not headers:
         return
-    table_style = doc.tables[-1].style if doc.tables else "Table Grid"
+    reference_table = doc.tables[-1] if doc.tables else None
+    table_style = reference_table.style if reference_table is not None else "Table Grid"
     table = doc.add_table(rows=1, cols=len(headers))
+    _copy_table_format(reference_table, table)
     try:
         table.style = table_style
     except Exception:
         table.style = "Table Grid"
     for idx, header in enumerate(headers):
-        table.rows[0].cells[idx].text = header
+        source_cell = None
+        if reference_table is not None and reference_table.rows:
+            source_cell = reference_table.rows[0].cells[min(idx, len(reference_table.rows[0].cells) - 1)]
+            _copy_cell_format(source_cell, table.rows[0].cells[idx])
+        _set_cell_text_like(table.rows[0].cells[idx], header, source_cell)
     for row in rows[:100]:
         cells = table.add_row().cells
         for idx in range(len(headers)):
-            cells[idx].text = str(row[idx] if idx < len(row) and row[idx] is not None else "")
+            source_cell = None
+            if reference_table is not None and reference_table.rows:
+                source_row = reference_table.rows[-1]
+                source_cell = source_row.cells[min(idx, len(source_row.cells) - 1)]
+                _copy_cell_format(source_cell, cells[idx])
+            value = row[idx] if idx < len(row) and row[idx] is not None else ""
+            _set_cell_text_like(cells[idx], str(value), source_cell)
+    if after is not None:
+        after._p.addnext(table._tbl)
+
+
+def _insert_table_rows(table: Table, after_row: int, rows: List[List[Any]]) -> int:
+    if not rows or not table.rows:
+        return 0
+    insert_after = max(1, min(int(after_row or len(table.rows)), len(table.rows)))
+    anchor_row = table.rows[insert_after - 1]
+    reference_row = anchor_row
+    inserted = 0
+    for values in rows[:100]:
+        new_row = table.add_row()
+        try:
+            if reference_row._tr.trPr is not None:
+                existing = new_row._tr.trPr
+                if existing is not None:
+                    new_row._tr.remove(existing)
+                new_row._tr.insert(0, deepcopy(reference_row._tr.trPr))
+        except Exception:
+            pass
+        for idx, cell in enumerate(new_row.cells):
+            source_cell = reference_row.cells[min(idx, len(reference_row.cells) - 1)]
+            _copy_cell_format(source_cell, cell)
+            value = values[idx] if idx < len(values) and values[idx] is not None else ""
+            _set_cell_text_like(cell, str(value), source_cell)
+        reference_row._tr.addnext(new_row._tr)
+        reference_row = new_row
+        inserted += 1
+    return inserted
 
 
 def apply_word_patch(input_path: str, output_path: str, patch: Dict[str, Any]) -> List[str]:
     doc = Document(input_path)
     changes: List[str] = []
+    paragraph_targets, table_targets = _build_word_targets(doc)
+    actions = patch.get("actions", [])
+    if len(actions) > 80:
+        raise WordProcessingError("План содержит слишком много правок за один проход. Разделите задачу на части.")
 
-    for action in patch.get("actions", []):
+    for action in actions:
         if not isinstance(action, dict):
-            continue
+            raise WordProcessingError("ИИ вернул некорректное действие в плане Word-правок.")
         action_type = action.get("type")
 
-        if action_type == "append_section":
+        if action_type == "replace_text":
+            target_id = str(action.get("target_id") or "").upper()
+            target = paragraph_targets.get(target_id)
+            old_text = str(action.get("old_text") or "")
+            new_text = str(action.get("new_text") or "")
+            if target is None:
+                raise WordProcessingError(f"Не найден адрес правки {target_id}.")
+            if not _replace_text_preserving_xml(target, old_text, new_text):
+                raise WordProcessingError(
+                    f"В элементе {target_id} не найден точный текст для замены: «{old_text[:120]}»."
+                )
+            changes.append(f"Точечно изменён текст в {target_id}")
+
+        elif action_type == "replace_block":
+            target_id = str(action.get("target_id") or "").upper()
+            target = paragraph_targets.get(target_id)
+            paragraphs = [str(p) for p in action.get("paragraphs", []) if str(p or "").strip()]
+            if target is None:
+                raise WordProcessingError(f"Не найден адрес правки {target_id}.")
+            if not paragraphs:
+                raise WordProcessingError(f"Для замены {target_id} не передан новый текст.")
+            _clear_and_set_paragraph(target, paragraphs[0])
+            last = target
+            for text in paragraphs[1:]:
+                last = _insert_paragraph_after(last, text, format_source=target)
+            changes.append(f"Заменён блок {target_id} с сохранением его стиля")
+
+        elif action_type == "insert_after":
+            target_id = str(action.get("target_id") or "").upper()
+            target = paragraph_targets.get(target_id)
+            paragraphs = [str(p) for p in action.get("paragraphs", []) if str(p or "").strip()]
+            if target is None:
+                raise WordProcessingError(f"Не найден адрес вставки {target_id}.")
+            if not paragraphs:
+                raise WordProcessingError(f"Для вставки после {target_id} не передан текст.")
+            body_reference = _body_reference_after(target, doc)
+            _add_paragraphs(doc, paragraphs, after=target, format_source=body_reference or target)
+            changes.append(f"После {target_id} добавлено абзацев: {len(paragraphs)}")
+
+        elif action_type == "format_like":
+            target_id = str(action.get("target_id") or "").upper()
+            reference_id = str(action.get("reference_id") or "").upper()
+            target = paragraph_targets.get(target_id)
+            reference = paragraph_targets.get(reference_id)
+            if target is None or reference is None:
+                raise WordProcessingError(
+                    f"Не найден адрес форматирования: target={target_id}, reference={reference_id}."
+                )
+            _copy_paragraph_format(reference, target)
+            for run in target.runs:
+                _copy_run_format(reference, run)
+            changes.append(f"Оформление {target_id} приведено по образцу {reference_id}")
+
+        elif action_type == "insert_table_rows":
+            table_id = str(action.get("table_id") or "").upper()
+            table = table_targets.get(table_id)
+            if table is None:
+                raise WordProcessingError(f"Не найдена таблица {table_id}.")
+            rows = action.get("rows") or []
+            inserted = _insert_table_rows(table, int(action.get("after_row") or len(table.rows)), rows)
+            if not inserted:
+                raise WordProcessingError(f"Для таблицы {table_id} не переданы строки.")
+            changes.append(f"В {table_id} добавлено строк: {inserted}")
+
+        elif action_type == "append_section":
             heading = str(action.get("heading") or "Новый раздел")
             body_ref = _last_text_paragraph(doc)
             heading_para = _add_heading(doc, heading, level=2)
@@ -817,15 +1269,11 @@ def apply_word_patch(input_path: str, output_path: str, patch: Dict[str, Any]) -
             heading = str(action.get("new_heading") or action.get("heading") or "Новый раздел")
             anchor = _find_paragraph_containing(doc, needle)
             if not anchor:
-                body_ref = _last_text_paragraph(doc)
-                heading_para = _add_heading(doc, heading, level=2)
-                _add_paragraphs(doc, [str(p) for p in action.get("paragraphs", [])], after=heading_para, format_source=body_ref)
-                changes.append(f"Раздел «{heading}» добавлен в конец, так как не найден фрагмент «{needle}»")
-            else:
-                body_ref = _body_reference_after(anchor, doc)
-                last = _insert_paragraph_after(anchor, heading, style="Heading 2", format_source=anchor)
-                _add_paragraphs(doc, [str(p) for p in action.get("paragraphs", [])], after=last, format_source=body_ref)
-                changes.append(f"Раздел «{heading}» вставлен после фрагмента «{needle}»")
+                raise WordProcessingError(f"Не найден заголовок/фрагмент для вставки: «{needle}».")
+            body_ref = _body_reference_after(anchor, doc)
+            last = _add_heading(doc, heading, level=2, after=anchor)
+            _add_paragraphs(doc, [str(p) for p in action.get("paragraphs", [])], after=last, format_source=body_ref)
+            changes.append(f"Раздел «{heading}» вставлен после фрагмента «{needle}»")
 
         elif action_type == "replace_paragraph_contains":
             needle = str(action.get("contains") or "")
@@ -840,8 +1288,7 @@ def apply_word_patch(input_path: str, output_path: str, patch: Dict[str, Any]) -
                     last = _insert_paragraph_after(last, text, format_source=target)
                 changes.append(f"Заменён абзац, содержащий «{needle}»")
             else:
-                _add_paragraphs(doc, paragraphs, format_source=_last_text_paragraph(doc))
-                changes.append(f"Не найден фрагмент «{needle}», новая редакция добавлена в конец")
+                raise WordProcessingError(f"Не найден фрагмент для замены: «{needle}».")
 
         elif action_type == "append_paragraphs":
             paragraphs = [str(p) for p in action.get("paragraphs", [])]
@@ -849,11 +1296,186 @@ def apply_word_patch(input_path: str, output_path: str, patch: Dict[str, Any]) -
             changes.append(f"Добавлены абзацы: {len([p for p in paragraphs if p.strip()])}")
 
         elif action_type == "add_table":
-            _add_table(doc, action.get("heading"), action.get("headers") or [], action.get("rows") or [])
+            after_target_id = str(action.get("after_target_id") or "").upper()
+            after = paragraph_targets.get(after_target_id) if after_target_id else None
+            if after_target_id and after is None:
+                raise WordProcessingError(f"Не найден адрес для вставки таблицы {after_target_id}.")
+            _add_table(
+                doc,
+                action.get("heading"),
+                action.get("headers") or [],
+                action.get("rows") or [],
+                after=after,
+            )
             changes.append(f"Добавлена таблица «{action.get('heading') or 'без заголовка'}»")
 
+        else:
+            raise WordProcessingError(f"ИИ предложил неподдерживаемое действие Word: {action_type}.")
+
+    if not changes:
+        raise WordProcessingError("План Word-правок не содержит применимых изменений.")
     doc.save(output_path)
     return changes
+
+
+def _section_signature(doc: Document) -> List[Tuple[Any, ...]]:
+    fields = (
+        "page_width",
+        "page_height",
+        "top_margin",
+        "right_margin",
+        "bottom_margin",
+        "left_margin",
+        "gutter",
+        "header_distance",
+        "footer_distance",
+        "orientation",
+        "start_type",
+    )
+    return [
+        tuple(str(getattr(section, field, None)) for field in fields)
+        for section in doc.sections
+    ]
+
+
+def _zip_entries(path: str) -> Dict[str, bytes]:
+    with zipfile.ZipFile(path, "r") as archive:
+        bad_file = archive.testzip()
+        if bad_file:
+            raise WordProcessingError(f"Повреждена внутренняя часть DOCX: {bad_file}")
+        return {name: archive.read(name) for name in archive.namelist()}
+
+
+def _asset_hashes(entries: Dict[str, bytes]) -> List[Tuple[str, str]]:
+    prefixes = ("word/media/", "word/embeddings/", "word/charts/", "word/diagrams/")
+    return sorted(
+        (name, hashlib.sha256(data).hexdigest())
+        for name, data in entries.items()
+        if name.startswith(prefixes)
+    )
+
+
+def _xml_text_for_prefixes(entries: Dict[str, bytes], prefixes: Tuple[str, ...]) -> Dict[str, str]:
+    from xml.etree import ElementTree
+
+    result = {}
+    for name, data in entries.items():
+        if not any(name.startswith(prefix) for prefix in prefixes) or not name.endswith(".xml"):
+            continue
+        try:
+            root = ElementTree.fromstring(data)
+            text_parts = [
+                node.text or ""
+                for node in root.iter()
+                if node.tag.endswith("}t") or node.tag.endswith("}instrText")
+            ]
+            result[name] = "".join(text_parts)
+        except Exception:
+            result[name] = hashlib.sha256(data).hexdigest()
+    return result
+
+
+def _xml_feature_counts(entries: Dict[str, bytes]) -> Dict[str, int]:
+    document_xml = entries.get("word/document.xml", b"")
+    return {
+        "fields": document_xml.count(b"<w:fldChar") + document_xml.count(b"<w:instrText"),
+        "bookmarks": document_xml.count(b"<w:bookmarkStart"),
+        "drawings": document_xml.count(b"<w:drawing") + document_xml.count(b"<w:pict"),
+        "content_controls": document_xml.count(b"<w:sdt"),
+        "tables": document_xml.count(b"<w:tbl"),
+    }
+
+
+def _external_relationships(entries: Dict[str, bytes]) -> List[Tuple[str, str]]:
+    from xml.etree import ElementTree
+
+    relationships = []
+    for name, data in entries.items():
+        if not name.endswith(".rels"):
+            continue
+        try:
+            root = ElementTree.fromstring(data)
+        except Exception:
+            continue
+        for node in root:
+            if node.attrib.get("TargetMode") == "External":
+                relationships.append((node.attrib.get("Type", ""), node.attrib.get("Target", "")))
+    return sorted(relationships)
+
+
+def _word_definition_ids(entries: Dict[str, bytes], part_name: str, element_suffix: str, attribute_suffix: str) -> List[str]:
+    from xml.etree import ElementTree
+
+    data = entries.get(part_name)
+    if not data:
+        return []
+    try:
+        root = ElementTree.fromstring(data)
+    except Exception:
+        return []
+    values = []
+    for node in root.iter():
+        if not node.tag.endswith("}" + element_suffix):
+            continue
+        for name, value in node.attrib.items():
+            if name.endswith("}" + attribute_suffix) or name == attribute_suffix:
+                values.append(value)
+                break
+    return sorted(values)
+
+
+def validate_word_result(input_path: str, output_path: str, patch: Dict[str, Any]) -> List[str]:
+    if not os.path.exists(output_path) or os.path.getsize(output_path) < 500:
+        raise WordProcessingError("Получившийся DOCX пуст или не был сохранен.")
+
+    original_entries = _zip_entries(input_path)
+    result_entries = _zip_entries(output_path)
+    original_doc = Document(input_path)
+    result_doc = Document(output_path)
+
+    if _section_signature(original_doc) != _section_signature(result_doc):
+        raise WordProcessingError("После правки изменились секции, формат страницы или поля документа.")
+    if _asset_hashes(original_entries) != _asset_hashes(result_entries):
+        raise WordProcessingError("После правки изменились встроенные изображения, диаграммы или вложения.")
+
+    protected_prefixes = (
+        "word/header",
+        "word/footer",
+        "word/footnotes",
+        "word/endnotes",
+        "word/comments",
+    )
+    if _xml_text_for_prefixes(original_entries, protected_prefixes) != _xml_text_for_prefixes(
+        result_entries, protected_prefixes
+    ):
+        raise WordProcessingError("После правки неожиданно изменились колонтитулы, сноски или комментарии.")
+    if _external_relationships(original_entries) != _external_relationships(result_entries):
+        raise WordProcessingError("После правки изменились внешние ссылки документа.")
+    if _word_definition_ids(original_entries, "word/styles.xml", "style", "styleId") != _word_definition_ids(
+        result_entries, "word/styles.xml", "style", "styleId"
+    ):
+        raise WordProcessingError("После правки изменился набор стилей Word.")
+    if _word_definition_ids(
+        original_entries, "word/numbering.xml", "abstractNum", "abstractNumId"
+    ) != _word_definition_ids(result_entries, "word/numbering.xml", "abstractNum", "abstractNumId"):
+        raise WordProcessingError("После правки изменилась схема нумерации Word.")
+
+    before_features = _xml_feature_counts(original_entries)
+    after_features = _xml_feature_counts(result_entries)
+    for feature in ("fields", "bookmarks", "drawings", "content_controls"):
+        if after_features[feature] < before_features[feature]:
+            raise WordProcessingError(f"После правки потеряны элементы Word: {feature}.")
+
+    add_table_count = sum(1 for action in patch.get("actions", []) if action.get("type") == "add_table")
+    if after_features["tables"] < before_features["tables"] + add_table_count:
+        raise WordProcessingError("После правки потерялась одна или несколько таблиц.")
+    if len(result_doc.paragraphs) < len(original_doc.paragraphs):
+        raise WordProcessingError("После правки неожиданно уменьшилось число абзацев документа.")
+
+    return [
+        "Проверена целостность DOCX",
+        "Сохранены исходные секции, формат страниц, колонтитулы, поля и изображения",
+    ]
 
 
 def edit_word_with_ai(input_path: str, file_name: str, request_text: str, user_id: str, reference_context: str = "") -> Tuple[Optional[str], str, List[str]]:
@@ -872,7 +1494,16 @@ def edit_word_with_ai(input_path: str, file_name: str, request_text: str, user_i
     if not Path(out_name).stem.endswith("_edited") and "edited" not in out_name.lower() and "исправ" not in out_name.lower():
         out_name = _safe_filename(f"{Path(out_name).stem}_edited.docx")
     output_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex[:6]}_{out_name}")
-    changes = apply_word_patch(input_path, output_path, patch)
+    try:
+        changes = apply_word_patch(input_path, output_path, patch)
+        changes.extend(validate_word_result(input_path, output_path, patch))
+    except Exception:
+        if os.path.exists(output_path):
+            try:
+                os.unlink(output_path)
+            except OSError:
+                pass
+        raise
     message = patch.get("message") or "Готово, внесла изменения в Word-файл."
 
     add_to_conversation(user_id, "user", f"[Правка Word {file_name}] {request_text}")
@@ -1041,7 +1672,13 @@ async def handle_word_document(update, context) -> None:
 
         user_id = get_dialog_key(update)
         remember_word_file(context, update.effective_chat.id, tmp_path, file_name, user_id)
-        remembered_text = document_to_text(tmp_path, max_paragraphs=260, max_tables=15, max_table_rows=40)
+        remembered_text = document_to_text(
+            tmp_path,
+            max_paragraphs=500,
+            max_tables=30,
+            max_table_rows=150,
+            max_cell_chars=1400,
+        )
         is_edit_request = looks_like_word_edit_request(user_request)
         if not is_edit_request:
             _remember_reference_document(context, user_id, file_name, remembered_text)
@@ -1063,13 +1700,14 @@ async def handle_word_document(update, context) -> None:
         if is_edit_request:
             out_path, message, changes = await asyncio.to_thread(edit_word_with_ai, tmp_path, file_name, user_request, user_id, reference_context)
             if out_path:
-                remember_word_file(context, update.effective_chat.id, out_path, os.path.basename(out_path), user_id)
+                delivery_name = _delivery_filename(out_path)
+                remember_word_file(context, update.effective_chat.id, out_path, delivery_name, user_id)
                 text_msg = message
                 if changes:
                     text_msg += "\n\nЧто изменено:\n" + "\n".join(f"• {change}" for change in changes[:12])
                 await update.message.reply_text(text_msg)
                 with open(out_path, "rb") as f:
-                    await update.message.reply_document(document=f, filename=os.path.basename(out_path))
+                    await update.message.reply_document(document=f, filename=delivery_name)
             else:
                 await update.message.reply_text(message)
         else:
@@ -1119,13 +1757,14 @@ async def handle_word_followup_text(update, context, text: str) -> bool:
             await update.message.reply_text("Поняла. Вношу изменения в последний Word-файл и пришлю новую копию.")
             out_path, message, changes = await asyncio.to_thread(edit_word_with_ai, input_path, file_name, request_text, user_id, reference_context)
             if out_path:
-                remember_word_file(context, update.effective_chat.id, out_path, os.path.basename(out_path), dialog_key)
+                delivery_name = _delivery_filename(out_path)
+                remember_word_file(context, update.effective_chat.id, out_path, delivery_name, dialog_key)
                 text_msg = message
                 if changes:
                     text_msg += "\n\nЧто изменено:\n" + "\n".join(f"• {change}" for change in changes[:12])
                 await update.message.reply_text(text_msg)
                 with open(out_path, "rb") as f:
-                    await update.message.reply_document(document=f, filename=os.path.basename(out_path))
+                    await update.message.reply_document(document=f, filename=delivery_name)
             else:
                 await update.message.reply_text(message)
         else:
@@ -1166,10 +1805,11 @@ async def handle_create_word_text(update, context, text: str) -> bool:
     try:
         await update.message.reply_chat_action(action="upload_document")
         out_path, message = await asyncio.to_thread(create_word_from_request, text)
-        remember_word_file(context, update.effective_chat.id, out_path, os.path.basename(out_path), get_dialog_key(update))
+        delivery_name = _delivery_filename(out_path)
+        remember_word_file(context, update.effective_chat.id, out_path, delivery_name, get_dialog_key(update))
         await update.message.reply_text(message)
         with open(out_path, "rb") as f:
-            await update.message.reply_document(document=f, filename=os.path.basename(out_path))
+            await update.message.reply_document(document=f, filename=delivery_name)
         return True
     except Exception as e:
         logger.exception(f"Create Word error: {e}")
