@@ -22,7 +22,12 @@ except Exception:
     DocxTemplate = None
 
 from config import DEEPSEEK_API_KEY, DEEPSEEK_MODEL, OPENAI_API_KEY, WORD_AI_PROVIDER, WORD_OPENAI_MODEL, logger
-from database import add_to_conversation
+from database import (
+    add_to_conversation,
+    delete_dialog_file_state,
+    get_dialog_file_state,
+    upsert_dialog_file_state,
+)
 from group_utils import get_dialog_key
 
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
@@ -229,6 +234,13 @@ def remember_word_file(context, chat_id: int, source_path: str, file_name: str, 
 
     info = {"path": stored_path, "file_name": safe_name, "saved_at": time_module.time()}
     word_files[dialog_key] = info
+    upsert_dialog_file_state(
+        dialog_key,
+        "word",
+        safe_name,
+        stored_path,
+        info["saved_at"],
+    )
     context.user_data["awaiting_word_request_by_dialog"] = {
         **context.user_data.get("awaiting_word_request_by_dialog", {}),
         dialog_key: True,
@@ -241,15 +253,21 @@ def _get_recent_word_context(context, dialog_key: str, max_age_seconds: int = 24
     word_files = context.user_data.get("word_files", {}) if hasattr(context, "user_data") else {}
     info = word_files.get(dialog_key)
     if not info:
+        info = get_dialog_file_state(dialog_key, "word")
+        if info:
+            word_files[dialog_key] = info
+    if not info:
         return None
     path = info.get("path")
     if not path or not os.path.exists(path):
         word_files.pop(dialog_key, None)
         context.user_data.get("awaiting_word_request_by_dialog", {}).pop(dialog_key, None)
+        delete_dialog_file_state(dialog_key, "word")
         return None
     if time_module.time() - float(info.get("saved_at") or 0) > max_age_seconds:
         word_files.pop(dialog_key, None)
         context.user_data.get("awaiting_word_request_by_dialog", {}).pop(dialog_key, None)
+        delete_dialog_file_state(dialog_key, "word")
         return None
     return info
 

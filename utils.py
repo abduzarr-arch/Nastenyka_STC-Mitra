@@ -30,6 +30,16 @@ DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
+def _transcribe_voice_file(file_path: str) -> str:
+    with open(file_path, "rb") as audio_file:
+        transcript = openai_client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file,
+            language="ru",
+        )
+    return (transcript.text or "").strip()
+
+
 def remember_reference_document(context, dialog_key: str, file_name: str, text: str, max_docs: int = 5) -> None:
     """Запоминает PDF/TXT как рабочий контекст для правки Word в этом диалоге."""
     if not text or not hasattr(context, "user_data"):
@@ -109,16 +119,24 @@ async def handle_voice_message(update, context):
             tmp_path = tmp.name
         await file.download_to_drive(tmp_path)
 
-        with open(tmp_path, "rb") as audio_file:
-            transcript = openai_client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file,
-                language="ru",
-            )
-
-        recognized_text = transcript.text.strip()
+        recognized_text = await to_thread(_transcribe_voice_file, tmp_path)
+        if not recognized_text:
+            await update.message.reply_text("Не удалось разобрать речь в голосовом сообщении.")
+            return
         logger.info(f"Распознанный текст: {recognized_text}")
         await update.message.reply_text(f"🎙 Распознано: {recognized_text}")
+
+        text_request_handler = context.application.bot_data.get("process_text_request")
+        if callable(text_request_handler):
+            try:
+                await text_request_handler(update, context, recognized_text)
+            except Exception as e:
+                logger.exception(f"Voice command processing error: {e}")
+                await update.message.reply_text(
+                    "Голос распознан, но не удалось выполнить команду. "
+                    "Попробуйте отправить распознанный текст обычным сообщением."
+                )
+            return
 
         if await handle_reminder_request(update, context, recognized_text):
             return

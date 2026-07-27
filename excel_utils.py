@@ -25,7 +25,12 @@ from config import (
     OPENAI_API_KEY,
     logger,
 )
-from database import add_to_conversation
+from database import (
+    add_to_conversation,
+    delete_dialog_file_state,
+    get_dialog_file_state,
+    upsert_dialog_file_state,
+)
 from group_utils import get_dialog_key
 
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
@@ -143,6 +148,13 @@ def remember_excel_file(context, chat_id: int, source_path: str, file_name: str,
         "saved_at": time_module.time(),
     }
     excel_files[dialog_key] = info
+    upsert_dialog_file_state(
+        dialog_key,
+        "excel",
+        safe_name,
+        stored_path,
+        info["saved_at"],
+    )
     context.user_data["awaiting_excel_request_by_dialog"] = {
         **context.user_data.get("awaiting_excel_request_by_dialog", {}),
         dialog_key: True,
@@ -155,15 +167,21 @@ def _get_recent_excel_context(context, dialog_key: str, max_age_seconds: int = 2
     excel_files = context.user_data.get("excel_files", {}) if hasattr(context, "user_data") else {}
     info = excel_files.get(dialog_key)
     if not info:
+        info = get_dialog_file_state(dialog_key, "excel")
+        if info:
+            excel_files[dialog_key] = info
+    if not info:
         return None
     path = info.get("path")
     if not path or not os.path.exists(path):
         excel_files.pop(dialog_key, None)
         context.user_data.get("awaiting_excel_request_by_dialog", {}).pop(dialog_key, None)
+        delete_dialog_file_state(dialog_key, "excel")
         return None
     if time_module.time() - float(info.get("saved_at") or 0) > max_age_seconds:
         excel_files.pop(dialog_key, None)
         context.user_data.get("awaiting_excel_request_by_dialog", {}).pop(dialog_key, None)
+        delete_dialog_file_state(dialog_key, "excel")
         return None
     return info
 

@@ -21,7 +21,8 @@ def _ensure_db_dir() -> None:
 
 def _connect(row_factory: bool = False) -> sqlite3.Connection:
     _ensure_db_dir()
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
+    conn.execute("PRAGMA busy_timeout=30000")
     if row_factory:
         conn.row_factory = sqlite3.Row
     return conn
@@ -70,6 +71,8 @@ def _task_from_row(row):
 
 def init_db():
     conn = _connect()
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     c = conn.cursor()
 
     c.execute('''
@@ -288,6 +291,18 @@ def init_db():
         )
     ''')
 
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS dialog_file_state (
+            dialog_key TEXT NOT NULL,
+            file_type TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            saved_at REAL NOT NULL,
+            PRIMARY KEY(dialog_key, file_type)
+        )
+    ''')
+    c.execute("CREATE INDEX IF NOT EXISTS idx_dialog_file_state_saved_at ON dialog_file_state(saved_at)")
+
     # Миграция для старой базы, где не было updated_at.
     c.execute("PRAGMA table_info(tasks)")
     columns = {row[1] for row in c.fetchall()}
@@ -446,6 +461,53 @@ def get_conversation_history(user_id, limit=50):
     rows = c.fetchall()
     conn.close()
     return [{"role": row["role"], "content": row["content"]} for row in reversed(rows)]
+
+
+def upsert_dialog_file_state(dialog_key, file_type, file_name, file_path, saved_at):
+    conn = _connect()
+    c = conn.cursor()
+    c.execute('''
+        INSERT INTO dialog_file_state (dialog_key, file_type, file_name, file_path, saved_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(dialog_key, file_type) DO UPDATE SET
+            file_name=excluded.file_name,
+            file_path=excluded.file_path,
+            saved_at=excluded.saved_at
+    ''', (str(dialog_key), str(file_type), str(file_name), str(file_path), float(saved_at)))
+    conn.commit()
+    conn.close()
+
+
+def get_dialog_file_state(dialog_key, file_type):
+    conn = _connect(row_factory=True)
+    c = conn.cursor()
+    c.execute('''
+        SELECT dialog_key, file_type, file_name, file_path, saved_at
+        FROM dialog_file_state
+        WHERE dialog_key = ? AND file_type = ?
+    ''', (str(dialog_key), str(file_type)))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "dialog_key": row["dialog_key"],
+        "file_type": row["file_type"],
+        "file_name": row["file_name"],
+        "path": row["file_path"],
+        "saved_at": float(row["saved_at"]),
+    }
+
+
+def delete_dialog_file_state(dialog_key, file_type):
+    conn = _connect()
+    c = conn.cursor()
+    c.execute(
+        "DELETE FROM dialog_file_state WHERE dialog_key = ? AND file_type = ?",
+        (str(dialog_key), str(file_type)),
+    )
+    conn.commit()
+    conn.close()
 
 
 

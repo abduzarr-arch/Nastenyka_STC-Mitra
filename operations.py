@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 from datetime import datetime, timedelta
@@ -877,14 +878,16 @@ async def maybe_handle_operational_request(update: Update, context: ContextTypes
     # Статус/сводки.
     if looks_like_manager_summary_request(text):
         from internet_search import split_telegram_text
-        for part in split_telegram_text(build_manager_summary()):
+        summary = await asyncio.to_thread(build_manager_summary)
+        for part in split_telegram_text(summary):
             await update.effective_message.reply_text(part)
         return True
 
     if looks_like_status_request(text):
         if _contains_any(text, MANAGER_SUMMARY_WORDS):
             from internet_search import split_telegram_text
-            for part in split_telegram_text(build_manager_summary()):
+            summary = await asyncio.to_thread(build_manager_summary)
+            for part in split_telegram_text(summary):
                 await update.effective_message.reply_text(part)
         else:
             await update.effective_message.reply_text(build_tasks_report(text))
@@ -1006,7 +1009,7 @@ async def schedule_operational_task_checker(app) -> None:
 
 
 async def send_daily_manager_summary(context) -> None:
-    summary = build_manager_summary()
+    summary = await asyncio.to_thread(build_manager_summary)
     from internet_search import split_telegram_text
     bot = context.bot
     for admin_id in ADMIN_IDS:
@@ -1064,7 +1067,8 @@ async def check_due_operational_tasks(app) -> None:
 
 async def daily_summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from internet_search import split_telegram_text
-    for part in split_telegram_text(build_manager_summary()):
+    summary = await asyncio.to_thread(build_manager_summary)
+    for part in split_telegram_text(summary):
         await update.effective_message.reply_text(part)
 
 

@@ -453,12 +453,34 @@ async def handle_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TY
         await handle_chat_member_update(update, context)
         await remember_chat_administrators(update, context)
 
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    error = context.error
+    exc_info = None
+    if error:
+        exc_info = (type(error), error, error.__traceback__)
+    logger.error("Необработанная ошибка Telegram update: %s", error, exc_info=exc_info)
+
+    message = getattr(update, "effective_message", None)
+    if not message:
+        return
+    try:
+        await message.reply_text(
+            "Не удалось завершить команду из-за внутренней ошибки. "
+            "Попробуйте повторить запрос немного короче."
+        )
+    except Exception:
+        logger.exception("Не удалось отправить пользователю сообщение об ошибке")
+
+
 def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN не задан в переменных Railway")
 
     init_db()
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.bot_data["process_text_request"] = process_text_request
+    app.add_error_handler(error_handler)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
