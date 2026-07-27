@@ -88,6 +88,15 @@ from yougile_utils import (
     yougile_structure_command,
     yougile_tasks_command,
 )
+from trz import (
+    maybe_handle_time_entry,
+    maybe_handle_trz_request,
+    my_trz_command,
+    trz_bot_commands,
+    trz_command,
+    trz_delete_command,
+    trz_report_command,
+)
 
 
 def _looks_like_drafting_request(text: str) -> bool:
@@ -134,6 +143,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         BotCommand("get_contact_info", "Мои контактные данные"),
         BotCommand("search", "Поиск в интернете"),
         BotCommand("ask", "Задать вопрос боту в группе"),
+        *trz_bot_commands(),
         *operational_bot_commands(),
         *yougile_bot_commands(),
     ])
@@ -161,7 +171,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/task_progress ID процент — Отметить прогресс\n"
         "/get_contact_info — Показать мои данные\n"
         "/search запрос — Найти актуальную информацию в интернете\n"
-        "/ask вопрос — Задать вопрос боту в группе, например /ask что решили по РПЗ\n\n"
+        "/ask вопрос — Задать вопрос боту в группе, например /ask что решили по РПЗ\n"
+        "/trz Объект | Задача | Часы — Записать трудозатраты\n"
+        "/my_trz — Мои ТРЗ за текущую неделю\n"
+        "/trz_report — Сводка ТРЗ за текущий месяц\n"
+        "/trz_delete ID — Удалить ошибочную запись\n\n"
         "⏰ Напоминания: напишите, например, «Напомни мне в 15:00 что у меня совещание».\n"
         "🎙 Голосовые: отправьте голосовое — я распознаю и отвечу.\n"
         "🖼 Изображения: отправьте фото с подписью-вопросом — я отвечу по картинке.\n"
@@ -170,6 +184,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👥 В группах: отвечаю на /ask@username_бота, ответ на моё сообщение или @упоминание, если оно доставляется Telegram.\n"
         "📣 Из лички могу отправить сообщение в привязанный рабочий чат: /send_to_chat рабочий текст\n"
         "🕘 Контроль поручений: «По объекту спартака нужно, чтобы Дима подготовил РПЗ к пн. Уточняй у него раз в день».\n"
+        "⏱ ТРЗ: /trz Объект | Задача | Часы. Свои записи: /my_trz. Сводка руководителя: /trz_report.\n"
         "📝 Word: отправьте .docx и затем напишите, что изменить — пришлю новую исправленную копию.\n"
         "🏗 Операционное ядро: /project, /op_task, /tasks, /op_update, /subtask, /daily_summary.\n"
         "👥 Командный контекст: в группе запоминаю адресованные мне задачи/статусы и использую их как общий рабочий контекст, но историю ответов веду отдельно по каждому участнику."
@@ -305,6 +320,9 @@ async def process_text_request(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Я на связи. Напишите вопрос после упоминания бота или используйте /ask вопрос.")
         return
 
+    if await maybe_handle_trz_request(update, context, user_message):
+        return
+
     if is_group_chat(update) and await maybe_handle_assignment_reply(update, context, user_message):
         return
 
@@ -434,10 +452,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_group_chat(update):
         remember_current_group_chat(update)
         await remember_visible_chat_participants(update, context)
+    raw_message = update.message.text or ""
+    if await maybe_handle_time_entry(update, context, raw_message):
+        return
     if is_group_chat(update) and not await is_addressed_to_bot(update, context):
         return
 
-    raw_message = update.message.text or ""
     user_message = await clean_group_trigger_text(update, context, raw_message) if is_group_chat(update) else raw_message
 
     if await handle_new_task(update, context):
@@ -515,6 +535,10 @@ def main():
     app.add_handler(CommandHandler("yg_structure", yougile_structure_command))
     app.add_handler(CommandHandler("yg_tasks", yougile_tasks_command))
     app.add_handler(CommandHandler("yg_create", yougile_create_task_command))
+    app.add_handler(CommandHandler("trz", trz_command))
+    app.add_handler(CommandHandler("my_trz", my_trz_command))
+    app.add_handler(CommandHandler("trz_report", trz_report_command))
+    app.add_handler(CommandHandler("trz_delete", trz_delete_command))
     app.add_handler(ChatMemberHandler(handle_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(ChatMemberHandler(handle_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

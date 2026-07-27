@@ -303,6 +303,28 @@ def init_db():
     ''')
     c.execute("CREATE INDEX IF NOT EXISTS idx_dialog_file_state_saved_at ON dialog_file_state(saved_at)")
 
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS time_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            username TEXT,
+            display_name TEXT,
+            chat_id INTEGER,
+            chat_title TEXT,
+            project_name TEXT NOT NULL,
+            task_name TEXT NOT NULL,
+            hours REAL NOT NULL,
+            work_date TEXT NOT NULL,
+            source_message_id INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(chat_id, source_message_id)
+        )
+    ''')
+    c.execute("CREATE INDEX IF NOT EXISTS idx_time_entries_work_date ON time_entries(work_date)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_time_entries_project ON time_entries(project_name)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_time_entries_user ON time_entries(user_id, work_date)")
+
     # Миграция для старой базы, где не было updated_at.
     c.execute("PRAGMA table_info(tasks)")
     columns = {row[1] for row in c.fetchall()}
@@ -508,6 +530,97 @@ def delete_dialog_file_state(dialog_key, file_type):
     )
     conn.commit()
     conn.close()
+
+
+def create_time_entry(
+    user_id,
+    username,
+    display_name,
+    chat_id,
+    chat_title,
+    project_name,
+    task_name,
+    hours,
+    work_date,
+    source_message_id=None,
+):
+    now = datetime.now(TIMEZONE).isoformat()
+    conn = _connect()
+    c = conn.cursor()
+    c.execute('''
+        INSERT OR IGNORE INTO time_entries
+        (user_id, username, display_name, chat_id, chat_title, project_name, task_name,
+         hours, work_date, source_message_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        int(user_id),
+        username,
+        display_name,
+        chat_id,
+        chat_title,
+        project_name,
+        task_name,
+        float(hours),
+        str(work_date),
+        source_message_id,
+        now,
+        now,
+    ))
+    created = c.rowcount > 0
+    entry_id = c.lastrowid if created else None
+    if not created and chat_id is not None and source_message_id is not None:
+        c.execute(
+            "SELECT id FROM time_entries WHERE chat_id = ? AND source_message_id = ?",
+            (chat_id, source_message_id),
+        )
+        row = c.fetchone()
+        entry_id = row[0] if row else None
+    conn.commit()
+    conn.close()
+    return {"id": entry_id, "created": created}
+
+
+def get_time_entries(start_date, end_date, user_id=None, project_query=None, limit=3000):
+    conditions = ["work_date >= ?", "work_date <= ?"]
+    params = [str(start_date), str(end_date)]
+    if user_id is not None:
+        conditions.append("user_id = ?")
+        params.append(int(user_id))
+    if project_query:
+        conditions.append("lower(project_name) LIKE lower(?)")
+        params.append(f"%{str(project_query).strip()}%")
+    params.append(int(limit))
+
+    conn = _connect(row_factory=True)
+    c = conn.cursor()
+    c.execute(f'''
+        SELECT * FROM time_entries
+        WHERE {" AND ".join(conditions)}
+        ORDER BY work_date DESC, created_at DESC
+        LIMIT ?
+    ''', params)
+    rows = c.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def get_time_entry(entry_id):
+    conn = _connect(row_factory=True)
+    c = conn.cursor()
+    c.execute("SELECT * FROM time_entries WHERE id = ?", (int(entry_id),))
+    row = c.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def delete_time_entry(entry_id):
+    conn = _connect()
+    c = conn.cursor()
+    c.execute("DELETE FROM time_entries WHERE id = ?", (int(entry_id),))
+    deleted = c.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
 
 
 

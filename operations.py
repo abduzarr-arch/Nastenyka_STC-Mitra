@@ -488,6 +488,12 @@ def build_manager_summary(limit: int = 40) -> str:
         t for t in active
         if t.get("control_enabled") and t.get("next_check_at") and t.get("next_check_at") <= _now()
     ]
+    try:
+        from trz import build_compact_time_summary
+        trz_block = build_compact_time_summary(days=7)
+    except Exception as exc:
+        logger.exception("Failed to build TRZ manager summary: %s", exc)
+        trz_block = "ТРЗ: не удалось получить данные."
 
     by_project: Dict[str, int] = {}
     for task in active:
@@ -526,6 +532,8 @@ def build_manager_summary(limit: int = 40) -> str:
         lines.append("\nАктивные задачи по объектам:")
         for project, count in sorted(by_project.items(), key=lambda item: item[1], reverse=True)[:10]:
             lines.append(f"— {project}: {count}")
+
+    lines.append("\n" + trz_block)
 
     if yougile_block:
         lines.append("\n" + yougile_block)
