@@ -30,6 +30,8 @@ COMPANY_NAME = os.getenv("COMPANY_NAME", "ООО «НТЦ Митра»")
 TIMEZONE = pytz.timezone(os.getenv("TIMEZONE", "Europe/Moscow"))
 
 MAX_RESPONSE_TOKENS = int(os.getenv("MAX_RESPONSE_TOKENS", "4000"))
+CONVERSATION_HISTORY_MESSAGES = int(os.getenv("CONVERSATION_HISTORY_MESSAGES", "12"))
+CONVERSATION_HISTORY_CHARS = int(os.getenv("CONVERSATION_HISTORY_CHARS", "16000"))
 VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o-mini")
 WORD_AI_PROVIDER = os.getenv("WORD_AI_PROVIDER", "auto").strip().lower()
 WORD_OPENAI_MODEL = os.getenv("WORD_OPENAI_MODEL", "gpt-4o")

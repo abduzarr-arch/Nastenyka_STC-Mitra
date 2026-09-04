@@ -52,6 +52,20 @@ async def get_bot_username(context: ContextTypes.DEFAULT_TYPE) -> str:
     return (bot_user.username or "").lower()
 
 
+def _starts_with_group_trigger(text: str, trigger: str) -> bool:
+    """Only a leading standalone trigger is considered a direct address."""
+    trigger = (trigger or "").strip()
+    if not trigger:
+        return False
+    return bool(
+        re.match(
+            rf"^\s*{re.escape(trigger)}(?=$|[\s,.:;!?…—–-])",
+            text or "",
+            flags=re.IGNORECASE,
+        )
+    )
+
+
 async def is_addressed_to_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """True, если сообщение нужно обрабатывать.
 
@@ -74,7 +88,6 @@ async def is_addressed_to_bot(update: Update, context: ContextTypes.DEFAULT_TYPE
         return True
 
     raw_text = _message_text(update)
-    text = raw_text.lower()
     bot_username = (bot_user.username or "").lower()
 
     # Надёжно проверяем @упоминание через entities. Это важнее простого поиска по строке,
@@ -98,9 +111,7 @@ async def is_addressed_to_bot(update: Update, context: ContextTypes.DEFAULT_TYPE
         return True
 
     for trigger in GROUP_TRIGGER_WORDS:
-        if not trigger:
-            continue
-        if text.startswith(trigger) or f" {trigger}" in text:
+        if _starts_with_group_trigger(raw_text, trigger):
             return True
 
     return False
@@ -116,9 +127,16 @@ async def clean_group_trigger_text(update: Update, context: ContextTypes.DEFAULT
         text = re.sub(rf"@{re.escape(bot_username)}\b", "", text, flags=re.IGNORECASE)
 
     for trigger in GROUP_TRIGGER_WORDS:
-        if not trigger:
+        if not _starts_with_group_trigger(text, trigger):
             continue
-        text = re.sub(rf"(^|\s){re.escape(trigger)}\b", " ", text, flags=re.IGNORECASE)
+        text = re.sub(
+            rf"^\s*{re.escape(trigger)}(?=$|[\s,.:;!?…—–-])\s*[,.:;!?…—–-]*\s*",
+            "",
+            text,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        break
 
     return text.strip(" \n\t,.:;—-")
 

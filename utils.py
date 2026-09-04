@@ -8,7 +8,10 @@ from asyncio import to_thread
 import requests
 from openai import OpenAI
 
+from assistant_context import bounded_history
 from config import (
+    CONVERSATION_HISTORY_CHARS,
+    CONVERSATION_HISTORY_MESSAGES,
     DEEPSEEK_API_KEY,
     DEEPSEEK_MODEL,
     DEEPSEEK_REASONING_EFFORT,
@@ -56,7 +59,7 @@ def remember_reference_document(context, dialog_key: str, file_name: str, text: 
     refs_by_dialog[str(dialog_key)] = items[-max_docs:]
 
 
-def ask_deepseek(prompt: str, user_id: str) -> str:
+def ask_deepseek(prompt: str, user_id: str, history_user_message: str = None) -> str:
     if not DEEPSEEK_API_KEY:
         logger.error("DEEPSEEK_API_KEY is missing")
         return "Не настроен ключ DeepSeek. Сообщите администратору."
@@ -66,7 +69,8 @@ def ask_deepseek(prompt: str, user_id: str) -> str:
         "Content-Type": "application/json",
     }
 
-    history = get_conversation_history(user_id, limit=20)
+    history = get_conversation_history(user_id, limit=max(2, CONVERSATION_HISTORY_MESSAGES))
+    history = bounded_history(history, CONVERSATION_HISTORY_CHARS)
     messages = [
         {
             "role": "system",
@@ -90,7 +94,9 @@ def ask_deepseek(prompt: str, user_id: str) -> str:
         response = requests.post(DEEPSEEK_API_URL, headers=headers, json=data, timeout=90)
         response.raise_for_status()
         answer = response.json()["choices"][0]["message"]["content"]
-        add_to_conversation(user_id, "user", prompt)
+        # Store the actual user message, not the augmented prompt with repeated
+        # task/member context. This keeps future calls focused and much smaller.
+        add_to_conversation(user_id, "user", history_user_message or prompt)
         add_to_conversation(user_id, "assistant", answer)
         return answer
     except Exception as e:

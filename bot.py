@@ -14,6 +14,7 @@ from telegram.ext import (
     filters,
 )
 
+from assistant_context import needs_directory_context
 from config import BOT_NAME, COMPANY_NAME, TELEGRAM_TOKEN, TIMEZONE, logger
 from database import (
     create_task,
@@ -382,8 +383,9 @@ async def process_text_request(update: Update, context: ContextTypes.DEFAULT_TYP
             f"Запрос пользователя:\n{user_message}"
         )
     team_context = build_team_context(update, user_message)
-    chats_context = format_group_chats_for_prompt()
-    members_context = format_chat_members_for_prompt()
+    needs_directory = needs_directory_context(user_message)
+    chats_context = format_group_chats_for_prompt() if needs_directory else ""
+    members_context = format_chat_members_for_prompt() if needs_directory else ""
     if is_drafting_request:
         if team_context:
             prompt += f"\n\nРабочий контекст из базы задач/договорённостей:\n{team_context}"
@@ -425,9 +427,9 @@ async def process_text_request(update: Update, context: ContextTypes.DEFAULT_TYP
         response = await asyncio.to_thread(answer_online, user_message, dialog_key)
         if is_online_search_failure(response):
             logger.warning("Online search failed; falling back to regular AI response")
-            response = await asyncio.to_thread(ask_deepseek, prompt, dialog_key)
+            response = await asyncio.to_thread(ask_deepseek, prompt, dialog_key, user_message)
     else:
-        response = await asyncio.to_thread(ask_deepseek, prompt, dialog_key)
+        response = await asyncio.to_thread(ask_deepseek, prompt, dialog_key, user_message)
     for part in split_telegram_text(response):
         await update.message.reply_text(part)
 

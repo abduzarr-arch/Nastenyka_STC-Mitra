@@ -48,6 +48,13 @@ def _clean_field(value: str) -> str:
     return re.sub(r"\s+", " ", (value or "").strip(" \t\r\n.;,-"))
 
 
+def _clean_template_value(value: str) -> str:
+    value = (value or "").strip()
+    value = value.strip('"\'«»“”` ')
+    value = value.strip("* ")
+    return _clean_field(value)
+
+
 def _extract_hours(value: str) -> Optional[float]:
     match = re.search(r"(?<!\d)(\d{1,4}(?:[.,]\d{1,2})?)(?!\d)", value or "")
     if not match:
@@ -58,41 +65,99 @@ def _extract_hours(value: str) -> Optional[float]:
     return hours
 
 
+def _looks_like_labeled_time_entry(text: str) -> bool:
+    """Recognize the employee-facing multiline TRZ form, even without /trz."""
+    lowered = (text or "").lower().replace("ё", "е")
+    return (
+        "дата работ" in lowered
+        and ("объект" in lowered or "проект" in lowered)
+        and ("трз" in lowered or "трудозатрат" in lowered)
+        and ("список работ" in lowered or "работ выполн" in lowered)
+    )
+
+
+def _extract_labeled_field(text: str, label_pattern: str) -> Optional[str]:
+    """Extract a value written before ``- label`` in a form line.
+
+    Quoted values may span several lines, which is useful for the work list.
+    """
+    match = re.search(
+        rf"(?:^|\r?\n)\s*(?P<value>\"[^\"]*\"|«[^»]*»|[^\r\n]+?)"
+        rf"\s*[\-–—]\s*(?:{label_pattern})",
+        text or "",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    return _clean_template_value(match.group("value")) if match else None
+
+
+def _parse_labeled_time_entry(text: str) -> Tuple[Optional[Dict], Optional[str]]:
+    date_text = _extract_labeled_field(text, r"дата\s+работ\b")
+    project_name = _extract_labeled_field(text, r"(?:объект|проект)\b")
+    hours_text = _extract_labeled_field(text, r"(?:трз\b|трудозатрат\w*)")
+    task_name = _extract_labeled_field(
+        text,
+        r"(?:список\s+работ\b|работ\w*\s+выполн\w*)",
+    )
+    if not all((date_text, project_name, hours_text, task_name)):
+        return None, (
+            "Не смогла разобрать заполненный шаблон ТРЗ. Проверьте четыре поля: "
+            "дата работ, объект, ТРЗ в часах и список выполненных работ."
+        )
+
+    work_date = _parse_date(date_text)
+    hours = _extract_hours(hours_text)
+    return {
+        "project_name": project_name,
+        "task_name": task_name,
+        "hours": hours,
+        "work_date": work_date,
+    }, None
+
+
 def parse_time_entry(text: str) -> Tuple[Optional[Dict], Optional[str]]:
     raw = (text or "").strip()
-    raw = re.sub(r"^/trz(?:@\w+)?\s*", "", raw, flags=re.IGNORECASE).strip()
-    raw = re.sub(r"^(?:трз|трудозатраты)\s*[:\-]?\s*", "", raw, flags=re.IGNORECASE).strip()
-    if not raw:
-        return None, "Укажите объект, задачу и часы."
-
-    parts = [_clean_field(part) for part in raw.split("|")]
-    if len(parts) >= 3:
-        project_name, task_name = parts[0], parts[1]
-        hours = _extract_hours(parts[2])
-        work_date = _parse_date(parts[3]) if len(parts) >= 4 and parts[3] else _today()
+    if _looks_like_labeled_time_entry(raw):
+        parsed, error = _parse_labeled_time_entry(raw)
+        if error:
+            return None, error
+        project_name = parsed["project_name"]
+        task_name = parsed["task_name"]
+        hours = parsed["hours"]
+        work_date = parsed["work_date"]
     else:
-        natural = re.match(
-            r"^(?:по\s+)?(?:объект(?:у|а)?|проект(?:у|а)?)?\s*[:\-]?\s*"
-            r"(?P<project>.+?)[,;]\s*"
-            r"(?:задач(?:а|е|у)?\s*[:\-]?\s*)?"
-            r"(?P<task>.+?)[,;]\s*"
-            r"(?P<hours>\d{1,4}(?:[.,]\d{1,2})?)\s*"
-            r"(?:ч(?:\.|ас(?:а|ов)?)?)"
-            r"(?:\s*(?:за|от)\s*(?P<date>\d{1,2}\.\d{1,2}\.\d{2,4}))?\s*$",
-            raw,
-            flags=re.IGNORECASE,
-        )
-        if not natural:
-            return None, (
-                "Не смогла разобрать запись. Используйте формат:\n"
-                "ТРЗ: Объект | Задача | Часы\n"
-                "Например: ТРЗ: Лиговский | расчёт плиты | 6"
+        raw = re.sub(r"^/trz(?:@\w+)?\s*", "", raw, flags=re.IGNORECASE).strip()
+        raw = re.sub(r"^(?:трз|трудозатраты)\s*[:\-]?\s*", "", raw, flags=re.IGNORECASE).strip()
+        if not raw:
+            return None, "Укажите объект, задачу и часы."
+
+        parts = [_clean_field(part) for part in raw.split("|")]
+        if len(parts) >= 3:
+            project_name, task_name = parts[0], parts[1]
+            hours = _extract_hours(parts[2])
+            work_date = _parse_date(parts[3]) if len(parts) >= 4 and parts[3] else _today()
+        else:
+            natural = re.match(
+                r"^(?:по\s+)?(?:объект(?:у|а)?|проект(?:у|а)?)?\s*[:\-]?\s*"
+                r"(?P<project>.+?)[,;]\s*"
+                r"(?:задач(?:а|е|у)?\s*[:\-]?\s*)?"
+                r"(?P<task>.+?)[,;]\s*"
+                r"(?P<hours>\d{1,4}(?:[.,]\d{1,2})?)\s*"
+                r"(?:ч(?:\.|ас(?:а|ов)?)?)"
+                r"(?:\s*(?:за|от)\s*(?P<date>\d{1,2}\.\d{1,2}\.\d{2,4}))?\s*$",
+                raw,
+                flags=re.IGNORECASE,
             )
-        project_name = _clean_field(natural.group("project"))
-        task_name = _clean_field(natural.group("task"))
-        hours = _extract_hours(natural.group("hours"))
-        date_text = natural.group("date")
-        work_date = _parse_date(date_text) if date_text else _today()
+            if not natural:
+                return None, (
+                    "Не смогла разобрать запись. Используйте формат:\n"
+                    "ТРЗ: Объект | Задача | Часы\n"
+                    "Например: ТРЗ: Лиговский | расчёт плиты | 6"
+                )
+            project_name = _clean_field(natural.group("project"))
+            task_name = _clean_field(natural.group("task"))
+            hours = _extract_hours(natural.group("hours"))
+            date_text = natural.group("date")
+            work_date = _parse_date(date_text) if date_text else _today()
 
     if not project_name or not task_name:
         return None, "Название объекта и задачи не должны быть пустыми."
@@ -113,6 +178,8 @@ def parse_time_entry(text: str) -> Tuple[Optional[Dict], Optional[str]]:
 
 def looks_like_time_entry(text: str) -> bool:
     value = (text or "").strip().lower()
+    if _looks_like_labeled_time_entry(value):
+        return True
     if not re.match(r"^(?:трз|трудозатраты)\b", value):
         return False
     return "|" in value or bool(
@@ -327,6 +394,8 @@ async def maybe_handle_time_entry(update: Update, context: ContextTypes.DEFAULT_
 
 
 def _looks_like_report_request(text: str) -> bool:
+    if _looks_like_labeled_time_entry(text):
+        return False
     lowered = (text or "").lower()
     if "трз" not in lowered and "трудозатрат" not in lowered:
         return False
