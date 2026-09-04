@@ -698,3 +698,69 @@ CONVERSATION_HISTORY_CHARS=16000
 сообщения без команды, в BotFather откройте `/setprivacy`, выберите Настеньку и
 установите `Disable`. Без изменения Privacy Mode сотрудники просто используют
 команду `/trz`.
+
+## Агент обслуживания кода
+
+Настенька может передавать проблему Codex через GitHub, но агент не публикует
+правки самостоятельно. Он создаёт отдельную ветку, запускает тесты и открывает
+Pull Request. Объединение выполняется только после подтверждения руководителя в
+личном чате с ботом.
+
+### 1. GitHub Secret для Codex
+
+В репозитории GitHub откройте **Settings → Secrets and variables → Actions →
+New repository secret** и создайте:
+
+```text
+OPENAI_API_KEY=ваш_ключ_OpenAI
+```
+
+Это GitHub Secret, а не Railway Variable. Ключ не попадает в код и передаётся
+непосредственно официальному `openai/codex-action`.
+
+Затем откройте **Settings → Actions → General → Workflow permissions**,
+выберите **Read and write permissions** и включите **Allow GitHub Actions to
+create and approve pull requests**. Workflow создаёт Pull Request, но не
+одобряет и не объединяет его без вашей команды в Telegram.
+
+### 2. Токен GitHub для Настеньки
+
+В GitHub создайте fine-grained Personal Access Token только для репозитория
+`Nastenyka_STC-Mitra` со следующими Repository permissions:
+
+```text
+Contents: Read and write
+Issues: Read and write
+Pull requests: Read and write
+```
+
+Добавьте токен в Railway Variables:
+
+```text
+GITHUB_MAINTENANCE_TOKEN=полученный_GitHub_токен
+GITHUB_REPOSITORY=abduzarr-arch/Nastenyka_STC-Mitra
+GITHUB_DEFAULT_BRANCH=main
+```
+
+Две последние переменные уже имеют эти значения по умолчанию, поэтому
+обязателен только `GITHUB_MAINTENANCE_TOKEN`.
+
+### 3. Использование
+
+Команды принимаются только в личном чате и только от Telegram ID из
+`ADMIN_IDS`:
+
+```text
+/dev_issue Настенька неверно распознаёт отчёт ТРЗ с двумя объектами
+/dev_status 15
+/dev_approve 23
+```
+
+`/dev_issue` создаёт GitHub Issue и запускает агента. После завершения
+`/dev_status` покажет ссылку на Pull Request. Команда `/dev_approve` сначала
+проверяет происхождение ветки, успешные тесты и отсутствие конфликта, а затем
+показывает кнопку **Опубликовать**. После нажатия Railway начнёт обычный деплой
+из ветки `main`.
+
+Не передавайте в тексте `/dev_issue` пароли, API-ключи, договоры или другие
+секретные данные. Описание заявки сохраняется в GitHub Issue.

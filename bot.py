@@ -7,6 +7,7 @@ from datetime import datetime
 from telegram import BotCommand, Update
 from telegram.ext import (
     ApplicationBuilder,
+    CallbackQueryHandler,
     ChatMemberHandler,
     CommandHandler,
     ContextTypes,
@@ -97,6 +98,13 @@ from trz import (
     trz_command,
     trz_delete_command,
     trz_report_command,
+)
+from maintenance import (
+    dev_approve_command,
+    dev_issue_command,
+    dev_status_command,
+    is_maintenance_admin,
+    maintenance_callback,
 )
 
 
@@ -190,6 +198,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🏗 Операционное ядро: /project, /op_task, /tasks, /op_update, /subtask, /daily_summary.\n"
         "👥 Командный контекст: в группе запоминаю адресованные мне задачи/статусы и использую их как общий рабочий контекст, но историю ответов веду отдельно по каждому участнику."
     )
+    if is_maintenance_admin(update):
+        help_text += (
+            "\n\n🛠 Обслуживание (только руководителю в личке):\n"
+            "/dev_issue описание — передать проблему кодовому агенту\n"
+            "/dev_status ID — проверить заявку\n"
+            "/dev_approve PR — проверить и подтвердить публикацию"
+        )
     await update.message.reply_text(help_text)
 
 
@@ -541,6 +556,15 @@ def main():
     app.add_handler(CommandHandler("my_trz", my_trz_command))
     app.add_handler(CommandHandler("trz_report", trz_report_command))
     app.add_handler(CommandHandler("trz_delete", trz_delete_command))
+    app.add_handler(CommandHandler("dev_issue", dev_issue_command))
+    app.add_handler(CommandHandler("dev_status", dev_status_command))
+    app.add_handler(CommandHandler("dev_approve", dev_approve_command))
+    app.add_handler(
+        CallbackQueryHandler(
+            maintenance_callback,
+            pattern=r"^dev(?:merge:\d+:[0-9a-f]{12}|cancel)$",
+        )
+    )
     app.add_handler(ChatMemberHandler(handle_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(ChatMemberHandler(handle_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

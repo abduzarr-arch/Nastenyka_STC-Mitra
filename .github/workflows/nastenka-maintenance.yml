@@ -1,0 +1,134 @@
+name: Nastenyka maintenance agent
+
+on:
+  repository_dispatch:
+    types: [nastenka_maintenance]
+
+concurrency:
+  group: nastenyka-maintenance-${{ github.event.client_payload.issue_number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  prepare-fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ISSUE_NUMBER: ${{ github.event.client_payload.issue_number }}
+      BRANCH_NAME: nastenyka-agent/issue-${{ github.event.client_payload.issue_number }}-${{ github.run_id }}
+    steps:
+      - name: Validate request
+        shell: bash
+        run: |
+          if ! [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "Invalid issue number"
+            exit 1
+          fi
+
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install application dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Build agent prompt from approved issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROMPT_PATH: ${{ runner.temp }}/nastenka-maintenance-prompt.md
+        shell: bash
+        run: |
+          cp .github/codex/prompts/maintenance.md "$PROMPT_PATH"
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}" --jq .body >> "$PROMPT_PATH"
+
+      - name: Create isolated branch
+        run: git switch -c "$BRANCH_NAME"
+
+      - name: Run Codex maintenance agent
+        id: codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: ${{ runner.temp }}/nastenka-maintenance-prompt.md
+          output-file: ${{ runner.temp }}/codex-output.md
+          sandbox: workspace-write
+          safety-strategy: drop-sudo
+          codex-args: '["--ephemeral"]'
+
+      - name: Protect maintenance boundary
+        shell: bash
+        run: |
+          if ! git diff --quiet -- \
+            .github/workflows/nastenka-maintenance.yml \
+            .github/codex/prompts/maintenance.md \
+            maintenance.py; then
+            echo "Agent attempted to modify protected maintenance files"
+            git diff -- \
+              .github/workflows/nastenka-maintenance.yml \
+              .github/codex/prompts/maintenance.md \
+              maintenance.py
+            exit 1
+          fi
+
+      - name: Run regression checks
+        shell: bash
+        run: |
+          python -m unittest discover -s tests -v
+          python -m compileall -q .
+
+      - name: Create Pull Request
+        id: pull-request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CODEX_OUTPUT: ${{ runner.temp }}/codex-output.md
+        shell: bash
+        run: |
+          if git diff --quiet && [[ -z "$(git ls-files --others --exclude-standard)" ]]; then
+            gh issue comment "$ISSUE_NUMBER" --body "Агент завершил анализ, но не предложил изменений. Проверьте журнал запуска: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            exit 0
+          fi
+
+          git config user.name "Nastenyka Maintenance Agent"
+          git config user.email "nastenka-agent@users.noreply.github.com"
+          git add -A
+          git commit -m "Agent fix for maintenance issue #${ISSUE_NUMBER}"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${BRANCH_NAME}"
+
+          {
+            echo "Исправление подготовлено кодовым агентом по заявке #${ISSUE_NUMBER}."
+            echo
+            echo "Автоматические тесты: успешно."
+            echo
+            echo "<!-- nastenyka-agent-tests:passed -->"
+            echo
+            echo "## Отчёт агента"
+            sed -n '1,180p' "$CODEX_OUTPUT"
+          } > "${RUNNER_TEMP}/pull-request-body.md"
+
+          PR_URL=$(gh pr create \
+            --base main \
+            --head "$BRANCH_NAME" \
+            --title "[Nastenyka Agent] $(gh issue view "$ISSUE_NUMBER" --json title --jq .title)" \
+            --body-file "${RUNNER_TEMP}/pull-request-body.md")
+          echo "url=$PR_URL" >> "$GITHUB_OUTPUT"
+          gh issue comment "$ISSUE_NUMBER" --body "Агент подготовил проверенный Pull Request: $PR_URL. Для публикации откройте личный чат с Настенькой и отправьте: \`/dev_approve ${PR_URL##*/}\`"
+
+      - name: Report workflow failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh issue comment "$ISSUE_NUMBER" --body "Агент не смог безопасно подготовить исправление. Журнал: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
